@@ -1,0 +1,45 @@
+{
+  "connection": {
+    "server": "pz-sql1.pzmc.org:1541",
+    "server_fallbacks": [
+      "pz-sql1:1541"
+    ],
+    "database": "UT_dev",
+    "username_env": "ONEC_USERNAME",
+    "password_env": "ONEC_PASSWORD"
+  },
+  "safety": {
+    "dry_run_env": "DRY_RUN",
+    "allow_document_write_env": "ALLOW_DOCUMENT_WRITE",
+    "allow_document_posting_env": "ALLOW_DOCUMENT_POSTING",
+    "integration_comment": "Создано интеграционным модулем BlankDemandPlanner"
+  },
+  "metadata": {
+    "stock_register": "ТоварыНаСкладах",
+    "stock_control_registers": [
+      "ПартииТоваровНаСкладах",
+      "ТоварыОрганизаций"
+    ],
+    "stock_dimensions": {
+      "nomenclature": "Номенклатура",
+      "warehouse": "Склад",
+      "characteristic": "ХарактеристикаНоменклатуры",
+      "series": "СерияНоменклатуры",
+      "quality": "Качество",
+      "project": "Проект",
+      "organization": "Организация"
+    },
+    "stock_resources": {
+      "quantity": "Количество",
+      "reserved": "",
+      "to_provide": ""
+    },
+    "documents": {
+      "assembly": "",
+      "transfer": ""
+    }
+  },
+  "logging": {
+    "directory": "onec_integration/logs"
+  }
+}

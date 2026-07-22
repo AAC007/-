@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/BlankDemandPlanner.Core/BlankDemandPlanner.Core.csproj" />
+    <Project Path="src/BlankDemandPlanner.Data/BlankDemandPlanner.Data.csproj" />
+    <Project Path="src/BlankDemandPlanner.Infrastructure/BlankDemandPlanner.Infrastructure.csproj" />
+    <Project Path="src/BlankDemandPlanner.Services/BlankDemandPlanner.Services.csproj" />
+    <Project Path="src/BlankDemandPlanner.UI/BlankDemandPlanner.UI.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BlankDemandPlanner.Tests/BlankDemandPlanner.Tests.csproj" />
+  </Folder>
+</Solution>

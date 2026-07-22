@@ -1,0 +1,21 @@
+{
+  "external_id": "assembly-demo-001",
+  "organization_id": "",
+  "warehouse_id": "",
+  "document_date": "2026-07-20T14:30:00+05:00",
+  "comment": "Создано интеграционным модулем BlankDemandPlanner. DRY_RUN.",
+  "responsible_id": "",
+  "kit_nomenclature_id": "",
+  "kit_characteristic_id": "",
+  "kit_quantity": 1,
+  "components": [
+    {
+      "nomenclature_id": "",
+      "characteristic_id": "",
+      "series_id": "",
+      "unit_id": "",
+      "quantity": 1
+    }
+  ],
+  "post": false
+}

@@ -1,0 +1,25 @@
+.env
+*.env
+logs/
+*.log
+*.tmp
+*.bak
+
+# Build outputs and local caches
+bin/
+obj/
+.tmp/
+.vs/
+.vscode/
+TestResults/
+*.user
+*.suo
+
+# Local working data and generated application artifacts
+Данные для работы/
+publish/
+
+# 1C helper generated reports/caches
+onec_integration/reports/
+onec_integration/.pytest_cache/
+onec_integration/**/__pycache__/
