@@ -112,7 +112,7 @@ public sealed class ExcelImportService(
         var run = CreateRun("ManufacturingBlankLibrary", filePath, await ComputeSha256Async(filePath, cancellationToken));
         dbContext.ImportRuns.Add(run);
 
-        var manufacturingProfiles = new IExcelImportProfile[] { new MatchedOrderBlankImportProfile(), new GuideBlankImportProfile(), new RotationalBlankImportProfile(), new PipeBlankImportProfile(), new PlateBlankImportProfile() };
+        var manufacturingProfiles = new IExcelImportProfile[] { new MskHeaderlessBlankImportProfile(), new MatchedOrderBlankImportProfile(), new GuideBlankImportProfile(), new RotationalBlankImportProfile(), new PipeBlankImportProfile(), new PlateBlankImportProfile() };
         foreach (var profile in manufacturingProfiles)
         {
             var readRowsBeforeProfile = report.ReadRows;
@@ -138,6 +138,7 @@ public sealed class ExcelImportService(
                 {
                     part.Name = partName;
                     part.Designation = FirstNotEmpty(Get(row, "Designation"), part.Designation);
+                    part.Source = RestoreLibrarySource(part.Source, Path.GetFileName(filePath));
                     part.UpdatedAt = DateTime.UtcNow;
                     report.UpdatedRows++;
                 }
@@ -150,6 +151,7 @@ public sealed class ExcelImportService(
                     var normalized = await normalizationService.NormalizeAsync(blankName, cancellationToken);
                     var status = await validationService.ValidateAsync(normalized, cancellationToken);
                     var blank = existingAlias?.CanonicalBlank ?? await GetOrCreateCanonicalBlankAsync(normalized, status, cancellationToken);
+                    RestoreNsiBlank(blank, existingAlias);
                     var activeMap = await FindPartBlankMapAsync(part, blank, cancellationToken);
                     if (activeMap is null)
                     {
@@ -180,6 +182,7 @@ public sealed class ExcelImportService(
 
                     if (existingAlias is not null && !string.IsNullOrWhiteSpace(blankName))
                     {
+                        existingAlias.IsActive = true;
                         existingAlias.SourceName = blankName;
                         existingAlias.NormalizedSourceName = normalized.NormalizedName;
                         existingAlias.Source = Path.GetFileName(filePath);
@@ -203,6 +206,11 @@ public sealed class ExcelImportService(
             }
 
             if (profile is MatchedOrderBlankImportProfile && report.ReadRows > readRowsBeforeProfile)
+            {
+                break;
+            }
+
+            if (profile is MskHeaderlessBlankImportProfile && report.ReadRows > readRowsBeforeProfile)
             {
                 break;
             }
@@ -426,6 +434,16 @@ public sealed class ExcelImportService(
 
     private async IAsyncEnumerable<IReadOnlyDictionary<string, string>> EnumerateRowsAsync(string filePath, IExcelImportProfile profile, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        if (profile is MskHeaderlessBlankImportProfile)
+        {
+            await foreach (var row in EnumerateMskHeaderlessRowsAsync(filePath, cancellationToken))
+            {
+                yield return row;
+            }
+
+            yield break;
+        }
+
         if (!CanEnumerateWithEpplus(filePath))
         {
             logger.LogWarning("EPPlus could not open {File}; using OpenXML fallback reader.", filePath);
@@ -468,6 +486,157 @@ public sealed class ExcelImportService(
                 }
             }
         }
+    }
+
+    private async IAsyncEnumerable<IReadOnlyDictionary<string, string>> EnumerateMskHeaderlessRowsAsync(string filePath, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await using var stream = File.OpenRead(filePath);
+        using var package = new ExcelPackage(stream);
+        foreach (var sheet in package.Workbook.Worksheets)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!LooksLikeMskHeaderlessSheet(sheet))
+            {
+                continue;
+            }
+
+            var rows = sheet.Dimension?.End.Row ?? 0;
+            for (var row = 1; row <= rows; row++)
+            {
+                var ips = sheet.Cells[row, 1].Text.Trim();
+                var rowFormat = DetectMskHeaderlessRowFormat(sheet, row);
+                var oneCCode = rowFormat switch
+                {
+                    MskHeaderlessRowFormat.FullBlankName => sheet.Cells[row, 7].Text.Trim(),
+                    MskHeaderlessRowFormat.CompactBlankName => sheet.Cells[row, 5].Text.Trim(),
+                    _ => sheet.Cells[row, 11].Text.Trim()
+                };
+                var blankName = rowFormat switch
+                {
+                    MskHeaderlessRowFormat.FullBlankName => sheet.Cells[row, 5].Text.Trim(),
+                    MskHeaderlessRowFormat.CompactBlankName => sheet.Cells[row, 4].Text.Trim(),
+                    _ => sheet.Cells[row, 12].Text.Trim()
+                };
+                if (!Regex.IsMatch(ips, @"^\d{6,11}$", RegexOptions.CultureInvariant) || string.IsNullOrWhiteSpace(blankName))
+                {
+                    continue;
+                }
+
+                yield return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Ips"] = ips,
+                    ["Designation"] = sheet.Cells[row, 2].Text.Trim(),
+                    ["PartName"] = sheet.Cells[row, 3].Text.Trim(),
+                    ["BlankTypeName"] = rowFormat == MskHeaderlessRowFormat.CompactBlankName ? string.Empty : sheet.Cells[row, 4].Text.Trim(),
+                    ["Dimensions"] = rowFormat == MskHeaderlessRowFormat.Legacy ? sheet.Cells[row, 5].Text.Trim() : string.Empty,
+                    ["Material"] = rowFormat == MskHeaderlessRowFormat.FullBlankName
+                        ? BuildMskMaterial(sheet.Cells[row, 6].Text.Trim(), sheet.Cells[row, 8].Text.Trim(), sheet.Cells[row, 9].Text.Trim())
+                        : BuildMskMaterial(sheet.Cells[row, 6].Text.Trim(), sheet.Cells[row, 7].Text.Trim(), sheet.Cells[row, 8].Text.Trim()),
+                    ["Quantity"] = rowFormat == MskHeaderlessRowFormat.FullBlankName
+                        ? sheet.Cells[row, 11].Text.Trim()
+                        : rowFormat == MskHeaderlessRowFormat.CompactBlankName
+                            ? sheet.Cells[row, 10].Text.Trim()
+                            : sheet.Cells[row, 9].Text.Trim(),
+                    ["Unit"] = rowFormat == MskHeaderlessRowFormat.CompactBlankName ? sheet.Cells[row, 9].Text.Trim() : sheet.Cells[row, 10].Text.Trim(),
+                    ["OneCCode"] = oneCCode,
+                    ["BlankName"] = blankName
+                };
+            }
+        }
+    }
+
+    private static bool LooksLikeMskHeaderlessSheet(ExcelWorksheet sheet)
+    {
+        if (sheet.Dimension is null || sheet.Dimension.End.Column < 10)
+        {
+            return false;
+        }
+
+        for (var row = 1; row <= Math.Min(10, sheet.Dimension.End.Row); row++)
+        {
+            var ips = sheet.Cells[row, 1].Text.Trim();
+            var rowFormat = DetectMskHeaderlessRowFormat(sheet, row);
+            var unit = rowFormat == MskHeaderlessRowFormat.CompactBlankName ? sheet.Cells[row, 9].Text.Trim() : sheet.Cells[row, 10].Text.Trim();
+            var code = rowFormat switch
+            {
+                MskHeaderlessRowFormat.FullBlankName => sheet.Cells[row, 7].Text.Trim(),
+                MskHeaderlessRowFormat.CompactBlankName => sheet.Cells[row, 5].Text.Trim(),
+                _ => sheet.Cells[row, 11].Text.Trim()
+            };
+            var blankName = rowFormat switch
+            {
+                MskHeaderlessRowFormat.FullBlankName => sheet.Cells[row, 5].Text.Trim(),
+                MskHeaderlessRowFormat.CompactBlankName => sheet.Cells[row, 4].Text.Trim(),
+                _ => sheet.Cells[row, 12].Text.Trim()
+            };
+            if (Regex.IsMatch(ips, @"^\d{6,11}$", RegexOptions.CultureInvariant) &&
+                LooksLikeMskUnit(unit) &&
+                LooksLikeMskCode(code) &&
+                !string.IsNullOrWhiteSpace(blankName))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool LooksLikeMskUnit(string value) =>
+        value.Contains("\u0448\u0442", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("\u043F\u043E\u0433", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("\u043C", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("\u0421\u20AC\u0421\u201A", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("\u0420\u0457\u0420\u0455\u0420\u0456", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("\u0420\u0458", StringComparison.OrdinalIgnoreCase);
+
+    private static bool LooksLikeMskCode(string value) =>
+        Regex.IsMatch(value, "^(\u0423\u0422|\u0420\u0408\u0420\u045E|UT)\\d+", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant) ||
+        Regex.IsMatch(value, "^\\d{6,11}$", RegexOptions.CultureInvariant);
+
+    private static MskHeaderlessRowFormat DetectMskHeaderlessRowFormat(ExcelWorksheet sheet, int row)
+    {
+        var column5 = sheet.Cells[row, 5].Text.Trim();
+        var column7 = sheet.Cells[row, 7].Text.Trim();
+        var column11 = sheet.Cells[row, 11].Text.Trim();
+        var unit9 = sheet.Cells[row, 9].Text.Trim();
+        var unit10 = sheet.Cells[row, 10].Text.Trim();
+        if (LooksLikeMskCode(column5) &&
+            LooksLikeMskUnit(unit9) &&
+            !LooksLikeMskUnit(unit10))
+        {
+            return MskHeaderlessRowFormat.CompactBlankName;
+        }
+
+        if (LooksLikeMskCode(column7) &&
+            !LooksLikeMskCode(column11))
+        {
+            return MskHeaderlessRowFormat.FullBlankName;
+        }
+
+        return MskHeaderlessRowFormat.Legacy;
+    }
+
+    private static string BuildMskMaterial(string material, string materialGost, string profileGost)
+    {
+        var result = FirstNotEmpty(material);
+        if (!string.IsNullOrWhiteSpace(materialGost) && !result.Contains(materialGost, StringComparison.OrdinalIgnoreCase))
+        {
+            result = $"{result} {materialGost}".Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(profileGost) && !result.Contains(profileGost, StringComparison.OrdinalIgnoreCase))
+        {
+            result = $"{result} {profileGost}".Trim();
+        }
+
+        return result;
+    }
+
+    private enum MskHeaderlessRowFormat
+    {
+        Legacy,
+        FullBlankName,
+        CompactBlankName
     }
 
     private static bool CanEnumerateWithEpplus(string filePath)
@@ -664,6 +833,8 @@ public sealed class ExcelImportService(
         blank = await dbContext.CanonicalBlanks.FirstOrDefaultAsync(x => x.CanonicalKey == normalized.CanonicalKey, cancellationToken);
         if (blank is not null)
         {
+            blank.IsActive = true;
+            blank.UpdatedAt = DateTime.UtcNow;
             return blank;
         }
 
@@ -701,6 +872,17 @@ public sealed class ExcelImportService(
         BlankType.BronzeBar => MeasurementUnit.Meter,
         _ => MeasurementUnit.Piece
     };
+
+    private static void RestoreNsiBlank(CanonicalBlank blank, BlankAlias? alias)
+    {
+        blank.IsActive = true;
+        blank.UpdatedAt = DateTime.UtcNow;
+        if (alias is not null)
+        {
+            alias.IsActive = true;
+            alias.UpdatedAt = DateTime.UtcNow;
+        }
+    }
 
     private async Task<Part?> FindPartAsync(string ips, CancellationToken cancellationToken)
     {
@@ -906,6 +1088,28 @@ public sealed class ExcelImportService(
 
     private static string Get(IReadOnlyDictionary<string, string> row, string key) => row.TryGetValue(key, out var value) ? value.Trim() : string.Empty;
     private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? string.Empty;
+    private static string RestoreLibrarySource(string? source, string importedFileName)
+    {
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            return importedFileName;
+        }
+
+        if (!source.Contains("[ARCHIVED_LIBRARY]", StringComparison.OrdinalIgnoreCase) &&
+            !source.Contains("Удалено из библиотеки", StringComparison.OrdinalIgnoreCase))
+        {
+            return source;
+        }
+
+        if (source.Contains("Удалено из библиотеки", StringComparison.OrdinalIgnoreCase))
+        {
+            return importedFileName;
+        }
+
+        var restored = source.Replace("[ARCHIVED_LIBRARY]", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
+        return string.IsNullOrWhiteSpace(restored) ? importedFileName : restored;
+    }
+
     private static bool IsDemandLibraryPartCandidate(IReadOnlyDictionary<string, string> row, string ips)
     {
         var unit = Get(row, "Unit");

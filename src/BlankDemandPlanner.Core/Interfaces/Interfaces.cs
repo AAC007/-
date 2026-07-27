@@ -55,6 +55,11 @@ public interface IExcelImportService
     Task<ImportReport> ImportManufacturingBlankLibraryAsync(string filePath, IProgress<ImportProgress>? progress, CancellationToken cancellationToken);
 }
 
+public interface IOneCStockSyncService
+{
+    Task<OneCStockSyncReport> SyncAsync(CancellationToken cancellationToken);
+}
+
 public interface IReportExportService
 {
     Task<string> ExportCalculationRunAsync(long calculationRunId, string outputDirectory, CancellationToken cancellationToken);

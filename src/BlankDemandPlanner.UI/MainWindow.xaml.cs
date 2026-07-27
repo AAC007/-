@@ -44,12 +44,77 @@ public partial class MainWindow : Window
         }
     }
 
+    private void LibraryRow_PreviewMouseRightButtonDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (sender is not DataGridRow { DataContext: LibraryRow row } dataGridRow)
+        {
+            return;
+        }
+
+        dataGridRow.IsSelected = true;
+        if (FindParent<DataGrid>(dataGridRow)?.DataContext is LibraryViewModel viewModel)
+        {
+            viewModel.SelectedRow = row;
+        }
+    }
+
+    private void MskRow_MouseEnter(object sender, System.Windows.Input.MouseEventArgs e)
+    {
+        if (sender is not DataGridRow { DataContext: MskLibraryRow row } dataGridRow)
+        {
+            return;
+        }
+
+        if (FindParent<DataGrid>(dataGridRow)?.DataContext is MskViewModel viewModel)
+        {
+            viewModel.SelectedRow = row;
+        }
+    }
+
+    private void MskRowsGrid_SelectedCellsChanged(object sender, SelectedCellsChangedEventArgs e)
+    {
+        if (sender is DataGrid { CurrentItem: MskLibraryRow row, DataContext: MskViewModel viewModel })
+        {
+            viewModel.SelectedRow = row;
+        }
+    }
+
+    private void MskRow_MouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (sender is not DataGridRow { DataContext: MskLibraryRow row } dataGridRow)
+        {
+            return;
+        }
+
+        dataGridRow.IsSelected = true;
+        if (FindParent<DataGrid>(dataGridRow)?.DataContext is MskViewModel viewModel &&
+            viewModel.OpenDrawingCommand.CanExecute(row))
+        {
+            viewModel.SelectedRow = row;
+            viewModel.OpenDrawingCommand.Execute(row);
+        }
+    }
+
     private void NsiRowsGrid_SelectedCellsChanged(object sender, SelectedCellsChangedEventArgs e)
     {
         if (sender is DataGrid { CurrentItem: NsiBlankRow row, DataContext: NormalizationViewModel viewModel } &&
             viewModel.LoadUsageCommand.CanExecute(row))
         {
             viewModel.LoadUsageCommand.Execute(row);
+        }
+    }
+
+    private void CalculationRow_PreviewMouseRightButtonDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (sender is not DataGridRow { DataContext: CalculationMaterialRow row } dataGridRow)
+        {
+            return;
+        }
+
+        dataGridRow.IsSelected = true;
+        if (FindParent<DataGrid>(dataGridRow)?.DataContext is CalculationViewModel viewModel)
+        {
+            viewModel.SelectedRow = row;
         }
     }
 

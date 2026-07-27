@@ -18,6 +18,7 @@ TestResults/
 # Local working data and generated application artifacts
 Данные для работы/
 publish/
+reports/
 
 # 1C helper generated reports/caches
 onec_integration/reports/

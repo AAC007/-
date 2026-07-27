@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using BlankDemandPlanner.Core.Entities;
 using BlankDemandPlanner.Core.Enums;
 using BlankDemandPlanner.Core.Interfaces;
+using BlankDemandPlanner.Core.Models;
 using BlankDemandPlanner.Data;
 using Microsoft.EntityFrameworkCore;
 using OfficeOpenXml;
@@ -10,6 +11,8 @@ namespace BlankDemandPlanner.Infrastructure.Export;
 
 public sealed class ReportExportService(BlankDemandPlannerDbContext dbContext) : IReportExportService
 {
+    private const string OneTimeBlankComment = "Разовая заготовка из расчета";
+
     private static readonly BlankType[] MeterBasedBlankTypes =
     [
         BlankType.RoundBar,
@@ -36,19 +39,14 @@ public sealed class ReportExportService(BlankDemandPlannerDbContext dbContext) :
             .ThenInclude(x => x.Sources)
             .FirstAsync(x => x.Id == calculationRunId, cancellationToken);
 
-        var path = Path.Combine(outputDirectory, $"Расчет_материалов_{run.Id}.xlsx");
+        var path = BuildBitrixRequestPath(outputDirectory);
         var materialRows = await BuildMaterialRequestRowsAsync(run, cancellationToken);
 
         using var package = new ExcelPackage();
         FillMaterialRequest(package.Workbook.Worksheets.Add("Заявка"), materialRows);
-        FillSummary(package.Workbook.Worksheets.Add("Итоги"), run.Items);
-        FillItems(package.Workbook.Worksheets.Add("К закупке"), run.Items.Where(x => x.PurchaseQuantity > 0));
-        FillItems(package.Workbook.Worksheets.Add("Без заготовки"), run.Items.Where(x => x.Status is CalculationStatus.MissingBlankMapping or CalculationStatus.MissingPart));
-        FillDetails(package.Workbook.Worksheets.Add("Детализация"), run.Items);
-        FillItems(package.Workbook.Worksheets.Add("Вне И-012"), run.Items.Where(x => x.CanonicalBlank != null && x.CanonicalBlank.I012Status != I012Status.Allowed));
-        FillItems(package.Workbook.Worksheets.Add("Ошибки"), run.Items.Where(x => x.Status != CalculationStatus.Ok));
+        FillGroupedRequest(package.Workbook.Worksheets.Add("По группе"), materialRows);
 
-        return await SavePackageReplacingWhenPossibleAsync(package, path, $"Расчет_материалов_{run.Id}", cancellationToken);
+        return await SavePackageReplacingWhenPossibleAsync(package, path, Path.GetFileNameWithoutExtension(path), cancellationToken);
     }
 
     public async Task<string> ExportLibraryAsync(string outputDirectory, CancellationToken cancellationToken)
@@ -186,6 +184,11 @@ public sealed class ReportExportService(BlankDemandPlannerDbContext dbContext) :
             .Where(x => ipsValues.Contains(x.Ips))
             .ToDictionaryAsync(x => x.Ips, StringComparer.OrdinalIgnoreCase, cancellationToken);
         var workInProgressByIps = await LoadWorkInProgressByIpsAsync(ipsValues, cancellationToken);
+        var oneTimeAssignments = run.Items
+            .Where(x => x.Comment?.StartsWith(OneTimeBlankComment, StringComparison.OrdinalIgnoreCase) == true)
+            .Select(x => (Item: x, DemandItemId: TryGetOneTimeDemandItemId(x.Comment)))
+            .Where(x => x.DemandItemId is not null)
+            .ToDictionary(x => x.DemandItemId!.Value, x => x.Item);
 
         var rows = new List<MaterialRequestExportRow>();
         var number = 1;
@@ -193,6 +196,26 @@ public sealed class ReportExportService(BlankDemandPlannerDbContext dbContext) :
         {
             var inProduction = ApplyWorkInProgress(demand.Ips, demand.Quantity, workInProgressByIps, out var effectiveDemandQuantity);
             parts.TryGetValue(demand.Ips, out var part);
+            if (oneTimeAssignments.TryGetValue(demand.Id, out var oneTimeItem))
+            {
+                var source = oneTimeItem.Sources.FirstOrDefault();
+                rows.Add(new MaterialRequestExportRow(
+                    number++,
+                    Clean(demand.Project),
+                    Clean(FirstNotEmpty(demand.ProductionSystem, demand.SerialNumber)),
+                    demand.Ips,
+                    Clean(FirstNotEmpty(demand.SourcePartName, source?.PartName, demand.Ips)),
+                    demand.Quantity,
+                    inProduction,
+                    oneTimeItem.PrimaryOneCCode ?? string.Empty,
+                    Clean(oneTimeItem.CanonicalName),
+                    DisplayUnit(oneTimeItem.Unit),
+                    oneTimeItem.PurchaseQuantity,
+                    BlankDemandDate(demand.DemandDate, 30),
+                    OneTimeBlankComment));
+                continue;
+            }
+
             var maps = part?.BlankMaps
                 .Where(x => x.IsActive)
                 .GroupBy(x => new { x.CanonicalBlankId, x.ConsumptionUnit })
@@ -272,29 +295,6 @@ public sealed class ReportExportService(BlankDemandPlannerDbContext dbContext) :
             "IPS детали",
             "Наименование",
             "Количество деталей",
-            "В производстве",
-            "Код УТ заготовки",
-            "Номенклатура",
-            "Ед. измерения",
-            "Кол-во к закупке",
-            "Дата потребности",
-            "Комментарий"
-        };
-
-        for (var i = 0; i < headers.Length; i++)
-        {
-            sheet.Cells[1, i + 1].Value = headers[i];
-        }
-
-        var cleanHeaders = new[]
-        {
-            "№",
-            "ПС",
-            "№ станка",
-            "IPS детали",
-            "Наименование",
-            "Количество деталей",
-            "В производстве",
             "Код УТ заготовки",
             "Номенклатура",
             "Ед. измерения",
@@ -302,9 +302,10 @@ public sealed class ReportExportService(BlankDemandPlannerDbContext dbContext) :
             "Дата потребности заготовки",
             "Комментарий"
         };
-        for (var i = 0; i < cleanHeaders.Length; i++)
+
+        for (var i = 0; i < headers.Length; i++)
         {
-            sheet.Cells[1, i + 1].Value = cleanHeaders[i];
+            sheet.Cells[1, i + 1].Value = headers[i];
         }
 
         var rowIndex = 2;
@@ -316,13 +317,45 @@ public sealed class ReportExportService(BlankDemandPlannerDbContext dbContext) :
             sheet.Cells[rowIndex, 4].Value = row.Ips;
             sheet.Cells[rowIndex, 5].Value = row.Name;
             sheet.Cells[rowIndex, 6].Value = row.PartQuantity;
-            sheet.Cells[rowIndex, 7].Value = row.InProductionQuantity;
-            sheet.Cells[rowIndex, 8].Value = row.OneCCode;
-            sheet.Cells[rowIndex, 9].Value = row.Nomenclature;
-            sheet.Cells[rowIndex, 10].Value = row.UnitName;
-            sheet.Cells[rowIndex, 11].Value = row.MaterialQuantity;
-            sheet.Cells[rowIndex, 12].Value = row.DemandDate?.ToLocalTime().ToString("dd.MM.yyyy");
-            sheet.Cells[rowIndex, 13].Value = row.Comment;
+            sheet.Cells[rowIndex, 7].Value = row.OneCCode;
+            sheet.Cells[rowIndex, 8].Value = row.Nomenclature;
+            sheet.Cells[rowIndex, 9].Value = row.UnitName;
+            sheet.Cells[rowIndex, 10].Value = row.MaterialQuantity;
+            sheet.Cells[rowIndex, 11].Value = row.DemandDate?.ToLocalTime().ToString("dd.MM.yyyy");
+            sheet.Cells[rowIndex, 12].Value = row.Comment;
+            rowIndex++;
+        }
+
+        sheet.Cells.AutoFitColumns();
+    }
+
+    private static void FillGroupedRequest(ExcelWorksheet sheet, IEnumerable<MaterialRequestExportRow> rows)
+    {
+        var headers = new[] { "Заготовка", "Код", "Ед. изм", "Всего Купить", "Комментарий" };
+        for (var i = 0; i < headers.Length; i++)
+        {
+            sheet.Cells[1, i + 1].Value = headers[i];
+        }
+
+        var groupedRows = rows
+            .Where(x => x.MaterialQuantity is > 0)
+            .GroupBy(x => new
+            {
+                Code = string.IsNullOrWhiteSpace(x.OneCCode) ? x.Ips : x.OneCCode,
+                x.UnitName,
+                x.Nomenclature
+            })
+            .OrderBy(x => x.Key.Nomenclature)
+            .ThenBy(x => x.Key.Code);
+
+        var rowIndex = 2;
+        foreach (var group in groupedRows)
+        {
+            sheet.Cells[rowIndex, 1].Value = group.Key.Nomenclature;
+            sheet.Cells[rowIndex, 2].Value = group.Key.Code;
+            sheet.Cells[rowIndex, 3].Value = group.Key.UnitName;
+            sheet.Cells[rowIndex, 4].Value = group.Sum(x => x.MaterialQuantity ?? 0m);
+            sheet.Cells[rowIndex, 5].Value = string.Join("; ", group.Select(x => x.Comment).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct());
             rowIndex++;
         }
 
@@ -411,20 +444,20 @@ public sealed class ReportExportService(BlankDemandPlannerDbContext dbContext) :
             return new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
         }
 
-        var ipsKeys = ipsValues.Select(NormalizeCodeKey).Where(x => x.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var ipsKeys = ipsValues.Select(StockCodeNormalizer.NormalizeForComparison).Where(x => x.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var stockItems = await dbContext.StockItems.AsNoTracking()
             .Where(x => x.StockSnapshotId == latestSnapshotId.Value && x.Unit == MeasurementUnit.Piece)
             .ToListAsync(cancellationToken);
 
         return stockItems
-            .Where(x => ipsKeys.Contains(NormalizeCodeKey(x.OneCCode)))
-            .GroupBy(x => NormalizeCodeKey(x.OneCCode), StringComparer.OrdinalIgnoreCase)
+            .Where(x => StockWarehouseRules.IsCmoWipWarehouse(x.Warehouse) && ipsKeys.Contains(StockCodeNormalizer.NormalizeForComparison(x.OneCCode)))
+            .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.Sum(i => i.Quantity), StringComparer.OrdinalIgnoreCase);
     }
 
     private static decimal ApplyWorkInProgress(string ips, decimal demandQuantity, IDictionary<string, decimal> workInProgressByIps, out decimal effectiveDemandQuantity)
     {
-        var key = NormalizeCodeKey(ips);
+        var key = StockCodeNormalizer.NormalizeForComparison(ips);
         if (!workInProgressByIps.TryGetValue(key, out var inProduction) || inProduction <= 0)
         {
             effectiveDemandQuantity = demandQuantity;
@@ -440,16 +473,20 @@ public sealed class ReportExportService(BlankDemandPlannerDbContext dbContext) :
     private static DateTime? BlankDemandDate(DateTime? detailDemandDate, int leadTimeDays) =>
         detailDemandDate?.AddDays(-Math.Max(0, leadTimeDays));
 
-    private static string NormalizeCodeKey(string? value)
+    private static string BuildBitrixRequestPath(string outputDirectory)
     {
-        var text = Clean(value).Trim();
-        if (text.Length == 0)
+        var date = DateTime.Now.ToString("dd.MM.yyyy");
+        var prefix = $"Заявка на закуп заготовок ЦМО от {date}";
+        var number = 1;
+        string path;
+        do
         {
-            return string.Empty;
+            path = Path.Combine(outputDirectory, $"{prefix} {number}.xlsx");
+            number++;
         }
+        while (File.Exists(path));
 
-        var withoutLeadingZeros = text.TrimStart('0');
-        return withoutLeadingZeros.Length == 0 ? "0" : withoutLeadingZeros;
+        return path;
     }
 
     private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) ?? string.Empty;
@@ -550,6 +587,19 @@ public sealed class ReportExportService(BlankDemandPlannerDbContext dbContext) :
         text.Contains('Ђ');
 
     private static int CyrillicScore(string text) => text.Count(ch => ch is >= 'А' and <= 'я' or 'ё' or 'Ё') - text.Count(ch => ch is 'Ђ' or 'С' or 'Р');
+
+    private static long? TryGetOneTimeDemandItemId(string? comment)
+    {
+        const string marker = "DemandItemId=";
+        var index = comment?.IndexOf(marker, StringComparison.OrdinalIgnoreCase) ?? -1;
+        if (index < 0 || comment is null)
+        {
+            return null;
+        }
+
+        var value = comment[(index + marker.Length)..].Trim();
+        return long.TryParse(value, out var id) ? id : null;
+    }
 
     private sealed record MaterialRequestExportRow(
         int Number,

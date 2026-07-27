@@ -46,6 +46,45 @@ public sealed class LibraryViewModelTests
     }
 
     [Fact]
+    public async Task Dashboard_counts_active_visible_rows_and_nsi_duplicate_filter_shows_duplicate_aliases()
+    {
+        await using var db = CreateDb();
+        var duplicateLeft = new CanonicalBlank { CanonicalName = "Круг D50", CanonicalKey = "DUP-L", BlankType = BlankType.RoundBar, I012Status = I012Status.Allowed };
+        var duplicateRight = new CanonicalBlank { CanonicalName = "Круг D50", CanonicalKey = "DUP-R", BlankType = BlankType.RoundBar, I012Status = I012Status.Allowed };
+        var unique = new CanonicalBlank { CanonicalName = "Лист 10", CanonicalKey = "UNIQUE", BlankType = BlankType.Plate, I012Status = I012Status.Allowed };
+        var archivedBlank = new CanonicalBlank { CanonicalName = "Архив", CanonicalKey = "ARCHIVE", IsActive = false };
+        db.BlankAliases.AddRange(
+            new BlankAlias { CanonicalBlank = duplicateLeft, OneCCode = "UT-DUP-1", SourceName = "Круг D50", NormalizedSourceName = "ROUND D50", Source = "test" },
+            new BlankAlias { CanonicalBlank = duplicateRight, OneCCode = "UT-DUP-2", SourceName = "Круг D50", NormalizedSourceName = "ROUND D50", Source = "test" },
+            new BlankAlias { CanonicalBlank = unique, OneCCode = "UT-UNIQUE", SourceName = "Лист 10", NormalizedSourceName = "PLATE 10", Source = "test" },
+            new BlankAlias { CanonicalBlank = archivedBlank, OneCCode = "UT-ARCHIVE", SourceName = "Архив", NormalizedSourceName = "ARCHIVE", Source = "test" });
+        var activePart = new Part { Ips = "100001", Name = "Активная деталь", HasMsk = true };
+        var noBlankPart = new Part { Ips = "100002", Name = "Без заготовки" };
+        var archivedPart = new Part { Ips = "100003", Name = "Архивная деталь", Source = "Потребность [ARCHIVED_LIBRARY]" };
+        db.PartBlankMaps.Add(new PartBlankMap { Part = activePart, CanonicalBlank = unique, Source = "test" });
+        db.Parts.AddRange(noBlankPart, archivedPart);
+        var batch = new DemandBatch { Name = "Потребность" };
+        db.DemandBatches.Add(batch);
+        await db.SaveChangesAsync();
+        db.CalculationRuns.Add(new CalculationRun { DemandBatchId = batch.Id, StartedAt = new DateTime(2026, 7, 26), Items = { new CalculationItem { CanonicalName = "old", PurchaseQuantity = 2 } } });
+        db.CalculationRuns.Add(new CalculationRun { DemandBatchId = batch.Id, StartedAt = new DateTime(2026, 7, 27), Items = { new CalculationItem { CanonicalName = "new", PurchaseQuantity = 1 } } });
+        await db.SaveChangesAsync();
+
+        var dashboard = new DashboardViewModel(db);
+        await dashboard.LoadAsync();
+        var nsi = new NormalizationViewModel(db, new StubExcelImportService(), new StubFileDialogService()) { DuplicatesOnly = true };
+        await nsi.LoadAsync();
+
+        dashboard.Parts.Should().Be(2);
+        dashboard.CanonicalBlanks.Should().Be(3);
+        dashboard.PartsWithoutBlank.Should().Be(1);
+        dashboard.PartsWithoutMsk.Should().Be(1);
+        dashboard.DuplicateCandidates.Should().Be(2);
+        dashboard.PurchasePositions.Should().Be(1);
+        nsi.Rows.Select(x => x.OneCCode).Should().BeEquivalentTo("UT-DUP-1", "UT-DUP-2");
+    }
+
+    [Fact]
     public async Task Library_editor_filters_blanks_and_saves_manual_part_mapping()
     {
         await using var db = CreateDb();
@@ -363,6 +402,53 @@ public sealed class LibraryViewModelTests
     }
 
     [Fact]
+    public async Task Blank_selection_keeps_selected_part_after_pick_and_opens_suggestions_when_typing()
+    {
+        await using var db = CreateDb();
+        db.Parts.AddRange(
+            new Part { Ips = "120001", Designation = "DET-120001", Name = "Первая деталь" },
+            new Part { Ips = "120002", Designation = "DET-120002", Name = "Вторая деталь" });
+        await db.SaveChangesAsync();
+
+        var viewModel = new BlankSelectionViewModel(db);
+        viewModel.PartSearch = "12";
+        await Task.Delay(200);
+
+        viewModel.PartSuggestions.Should().HaveCount(2);
+        viewModel.IsPartSuggestionsOpen.Should().BeTrue();
+
+        var selected = viewModel.PartSuggestions.First();
+        viewModel.SelectedPart = selected;
+
+        viewModel.SelectedPart.Should().Be(selected);
+        viewModel.PartSearch.Should().Be(selected.DisplayName);
+        viewModel.IsPartSuggestionsOpen.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Blank_selection_finds_blanks_by_material_word()
+    {
+        await using var db = CreateDb();
+        var blank = new CanonicalBlank
+        {
+            CanonicalName = "Круг D320 Сталь 40Х",
+            CanonicalKey = "PICK|ROUND|320|STEEL",
+            BlankType = BlankType.RoundBar,
+            DiameterMm = 320,
+            Material = "Сталь 40Х",
+            BaseUnit = MeasurementUnit.Meter
+        };
+        db.BlankAliases.Add(new BlankAlias { CanonicalBlank = blank, OneCCode = "УТ000004539", SourceName = "Круг ф 320 сталь 40Х", NormalizedSourceName = "Круг ф 320 сталь 40Х", Source = "test" });
+        await db.SaveChangesAsync();
+
+        var viewModel = new BlankSelectionViewModel(db) { Material = "Сталь" };
+
+        await viewModel.FindCommand.ExecuteAsync(null);
+
+        viewModel.Rows.Should().ContainSingle(x => x.OneCCode == "УТ000004539");
+    }
+
+    [Fact]
     public async Task Library_shows_parts_without_blank_and_blank_selection_uses_same_parts()
     {
         await using var db = CreateDb();
@@ -463,6 +549,43 @@ public sealed class LibraryViewModelTests
         viewModel.SummaryText.Should().Be("Деталей: 1; без заготовки: 1");
         (await db.PartBlankMaps.IgnoreQueryFilters().SingleAsync()).IsActive.Should().BeFalse();
         (await db.Parts.CountAsync()).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Library_delete_part_without_active_blank_archives_part_even_when_inactive_maps_exist()
+    {
+        await using var db = CreateDb();
+        var blank = new CanonicalBlank
+        {
+            CanonicalName = "Round D42",
+            CanonicalKey = "ROUNDBAR|D42|DELETE-INACTIVE",
+            BlankType = BlankType.RoundBar
+        };
+        var part = new Part { Ips = "400002", Name = "Deleted no active blank", Source = "Потребность" };
+        db.PartBlankMaps.Add(new PartBlankMap
+        {
+            Part = part,
+            CanonicalBlank = blank,
+            ConsumptionQuantity = 1,
+            ConsumptionUnit = MeasurementUnit.Meter,
+            Source = "test",
+            IsActive = false,
+            IsPrimary = false
+        });
+        var batch = new DemandBatch { Name = "Потребность" };
+        db.DemandItems.Add(new DemandItem { DemandBatch = batch, Part = part, Ips = part.Ips, SourcePartName = part.Name, Quantity = 1, Unit = "шт" });
+        await db.SaveChangesAsync();
+
+        var viewModel = new LibraryViewModel(db, new BlankNormalizationService());
+        await viewModel.LoadAsync();
+        var row = viewModel.Rows.Single();
+        row.CanonicalBlankId.Should().BeNull();
+
+        await viewModel.DeleteLibraryRowsCommand.ExecuteAsync(row);
+
+        viewModel.Rows.Should().BeEmpty();
+        (await db.Parts.AsNoTracking().SingleAsync()).Source.Should().Contain("[ARCHIVED_LIBRARY]");
+        (await db.DemandItems.AsNoTracking().SingleAsync()).PartId.Should().BeNull();
     }
 
     [Fact]
@@ -574,6 +697,70 @@ public sealed class LibraryViewModelTests
     }
 
     [Fact]
+    public async Task Library_import_reads_compact_blank_name_file_and_replaces_archived_mapping()
+    {
+        await using var db = CreateDb();
+        var oldBlank = new CanonicalBlank
+        {
+            CanonicalName = "Шестерня D58,5",
+            CanonicalKey = "OLD-GEAR-58",
+            BlankType = BlankType.RoundBar,
+            BaseUnit = MeasurementUnit.Meter
+        };
+        var part = new Part
+        {
+            Ips = "1410079",
+            Designation = "01.101.00.002",
+            Name = "Направляющая задней бабки",
+            Source = "Исходные данные для изготовления_заказа заготовок.xlsx; Удалено из библиотеки 2026-07-24 11:35"
+        };
+        db.PartBlankMaps.Add(new PartBlankMap
+        {
+            Part = part,
+            CanonicalBlank = oldBlank,
+            ConsumptionQuantity = 1,
+            ConsumptionUnit = MeasurementUnit.Meter,
+            Source = "old",
+            IsActive = false,
+            IsPrimary = false
+        });
+        db.BlankAliases.Add(new BlankAlias { CanonicalBlank = oldBlank, OneCCode = "1785547", SourceName = "Шестерня D58,5мм", NormalizedSourceName = "Шестерня D58,5мм", Source = "old" });
+        await db.SaveChangesAsync();
+
+        var path = Path.Combine(Path.GetTempPath(), $"bdp_compact_library_{Guid.NewGuid():N}.xlsx");
+        using (var package = new ExcelPackage(new FileInfo(path)))
+        {
+            var sheet = package.Workbook.Worksheets.Add("Лист Microsoft Excel");
+            sheet.Cells[1, 1].Value = "1410079";
+            sheet.Cells[1, 2].Value = "01.101.00.002";
+            sheet.Cells[1, 3].Value = "Направляющая задней бабки";
+            sheet.Cells[1, 4].Value = "Заготовка 50х105х1630мм Сталь 30ХГСА";
+            sheet.Cells[1, 5].Value = "УТ000013591";
+            sheet.Cells[1, 6].Value = "Сталь 30ХГС";
+            sheet.Cells[1, 7].Value = "ГОСТ 4543-105";
+            sheet.Cells[1, 8].Value = "ГОСТ 19903-2049";
+            sheet.Cells[1, 9].Value = "Шт";
+            sheet.Cells[1, 10].Value = 2;
+            await package.SaveAsync();
+        }
+
+        var importer = new ExcelImportService(db, new BlankNormalizationService(), new I012ValidationService(db), NullLogger<ExcelImportService>.Instance);
+        var report = await importer.ImportManufacturingBlankLibraryAsync(path, null, CancellationToken.None);
+        var viewModel = new LibraryViewModel(db, new BlankNormalizationService());
+        await viewModel.LoadAsync();
+
+        report.ReadRows.Should().Be(1);
+        var row = viewModel.Rows.Single(x => x.Ips == "1410079");
+        row.OneCCode.Should().Be("УТ000013591");
+        row.BlankName.Should().Contain("Заготовка 50х105х1630мм");
+        row.Material.Should().Contain("Сталь 30ХГС");
+        row.UnitName.Should().Be("шт");
+        row.Quantity.Should().Be("2");
+        row.Source.Should().Be(Path.GetFileName(path));
+        (await db.PartBlankMaps.CountAsync(x => x.PartId == row.PartId && x.IsActive)).Should().Be(1);
+    }
+
+    [Fact]
     public async Task Export_calculation_request_omits_material_rows_fully_covered_by_stock()
     {
         await using var db = CreateDb();
@@ -605,6 +792,49 @@ public sealed class LibraryViewModelTests
         var requestSheet = package.Workbook.Worksheets["Заявка"];
         requestSheet.Should().NotBeNull();
         requestSheet!.Dimension!.Rows.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Export_calculation_request_creates_bitrix_file_and_grouped_sheet()
+    {
+        await using var db = CreateDb();
+        var blank = new CanonicalBlank
+        {
+            CanonicalName = "Круг D70 Сталь 40Х",
+            CanonicalKey = "ROUND|D70|BITRIX-GROUP",
+            BlankType = BlankType.RoundBar,
+            BaseUnit = MeasurementUnit.Meter
+        };
+        var alias = new BlankAlias { CanonicalBlank = blank, OneCCode = "УТ000022665", SourceName = "Круг D70 Сталь 40Х ГОСТ 2590-2006 / ГОСТ 4543-2016", NormalizedSourceName = "Круг D70 Сталь 40Х", Source = "test" };
+        var firstPart = new Part { Ips = "700001", Name = "Деталь 1" };
+        var secondPart = new Part { Ips = "700002", Name = "Деталь 2" };
+        db.PartBlankMaps.AddRange(
+            new PartBlankMap { Part = firstPart, CanonicalBlank = blank, ConsumptionQuantity = 0.85m, ConsumptionUnit = MeasurementUnit.Meter, Source = "test" },
+            new PartBlankMap { Part = secondPart, CanonicalBlank = blank, ConsumptionQuantity = 0.46m, ConsumptionUnit = MeasurementUnit.Meter, Source = "test" });
+        var batch = new DemandBatch { Name = "Потребность" };
+        db.DemandItems.AddRange(
+            new DemandItem { DemandBatch = batch, Part = firstPart, Ips = firstPart.Ips, SourcePartName = firstPart.Name, Quantity = 1, Unit = "шт", DemandDate = new DateTime(2026, 7, 21) },
+            new DemandItem { DemandBatch = batch, Part = secondPart, Ips = secondPart.Ips, SourcePartName = secondPart.Name, Quantity = 1, Unit = "шт", DemandDate = new DateTime(2026, 7, 21) });
+        db.BlankAliases.Add(alias);
+        await db.SaveChangesAsync();
+
+        var run = await new BlankDemandCalculationService(db, new UnitConversionService(), NullLogger<BlankDemandCalculationService>.Instance)
+            .CalculateAsync(new CalculationOptions(batch.Id), CancellationToken.None);
+        var folder = Path.Combine(Path.GetTempPath(), $"bdp_bitrix_export_{Guid.NewGuid():N}");
+
+        var path = await new ReportExportService(db).ExportCalculationRunAsync(run.Id, folder, CancellationToken.None);
+
+        Path.GetFileName(path).Should().StartWith($"Заявка на закуп заготовок ЦМО от {DateTime.Now:dd.MM.yyyy} ");
+        using var package = new ExcelPackage(new FileInfo(path));
+        package.Workbook.Worksheets.Select(x => x.Name).Should().Equal("Заявка", "По группе");
+        package.Workbook.Worksheets["Заявка"]!.Cells[1, 7].Text.Should().Be("Код УТ заготовки");
+        package.Workbook.Worksheets["Заявка"]!.Cells[1, 7].Text.Should().NotBe("В производстве");
+        var groupedSheet = package.Workbook.Worksheets["По группе"];
+        groupedSheet.Should().NotBeNull();
+        groupedSheet!.Cells[2, 1].Text.Should().Be("Круг D70 Сталь 40Х ГОСТ 2590-2006 / ГОСТ 4543-2016");
+        groupedSheet.Cells[2, 2].Text.Should().Be("УТ000022665");
+        groupedSheet.Cells[2, 3].Text.Should().Be("пог. м");
+        groupedSheet.Cells[2, 4].GetValue<decimal>().Should().Be(1.31m);
     }
 
     [Fact]
@@ -718,6 +948,49 @@ public sealed class LibraryViewModelTests
     }
 
     [Fact]
+    public async Task Calculation_one_time_blank_assignment_does_not_update_library()
+    {
+        await using var db = CreateDb();
+        var blank = new CanonicalBlank
+        {
+            CanonicalName = "Круг D80",
+            CanonicalKey = "ROUND|D80|ONE-TIME",
+            BlankType = BlankType.RoundBar,
+            BaseUnit = MeasurementUnit.Meter
+        };
+        db.BlankAliases.Add(new BlankAlias { CanonicalBlank = blank, OneCCode = "УТ000080", SourceName = "Круг D80", NormalizedSourceName = "Круг D80", Source = "test" });
+        var part = new Part { Ips = "1668899", Name = "Опора ШВП задняя" };
+        var batch = new DemandBatch { Name = "Потребность" };
+        db.DemandItems.Add(new DemandItem
+        {
+            DemandBatch = batch,
+            Part = part,
+            Ips = part.Ips,
+            SourcePartName = part.Name,
+            Quantity = 2,
+            Unit = "шт",
+            DemandDate = new DateTime(2026, 7, 21)
+        });
+        await db.SaveChangesAsync();
+
+        var calculation = new BlankDemandCalculationService(db, new UnitConversionService(), NullLogger<BlankDemandCalculationService>.Instance);
+        var viewModel = new CalculationViewModel(db, calculation, new ReportExportService(db), new StubFileDialogService());
+        await viewModel.CalculateCommand.ExecuteAsync(null);
+        viewModel.SelectedRow = viewModel.Rows.Single();
+        viewModel.BlankSearch = "D80";
+        await viewModel.LoadBlankSuggestionsCommand.ExecuteAsync(null);
+        viewModel.SelectedBlank = viewModel.BlankSuggestions.Single();
+        viewModel.ConsumptionQuantityText = "0,5";
+
+        await viewModel.AssignBlankToSelectedCommand.ExecuteAsync(null);
+
+        (await db.PartBlankMaps.CountAsync()).Should().Be(0);
+        (await db.CalculationItems.CountAsync(x => x.Comment != null && x.Comment.StartsWith("Разовая заготовка из расчета"))).Should().Be(1);
+        viewModel.Rows.Single().Nomenclature.Should().Be("Круг D80");
+        viewModel.Rows.Single().MaterialQuantity.Should().Be("1");
+    }
+
+    [Fact]
     public async Task Demand_load_cleans_machine_number_replacement_character()
     {
         await using var db = CreateDb();
@@ -826,10 +1099,9 @@ public sealed class LibraryViewModelTests
         await viewModel.LoadCommand.ExecuteAsync(null);
         viewModel.ShowDetailsCommand.Execute(viewModel.Rows.First());
 
-        viewModel.DetailTitle.Should().Be("Детализация IPS 950001; всего деталей: 5");
+        viewModel.DetailTitle.Should().Be("Детализация IPS 950001; всего деталей: 5; дефицит: 0");
         viewModel.DetailRows.Select(x => x.DemandDate).Should().Equal("21.07.2026", "22.07.2026");
         viewModel.DetailRows.Select(x => x.Quantity).Should().Equal("2", "3");
-        viewModel.DetailRows.Select(x => x.WorkInProgressBefore).Should().Equal("4", "2");
         viewModel.DetailRows.Select(x => x.InProductionQuantity).Should().Equal("4", "2");
         viewModel.DetailRows.Select(x => x.WorkInProgressAfter).Should().Equal("2", "0");
         viewModel.DetailRows.Select(x => x.Project).Should().Equal("Проект 1", "Проект 2");
@@ -951,6 +1223,133 @@ public sealed class LibraryViewModelTests
     }
 
     [Fact]
+    public async Task Library_delete_part_without_blank_archives_row_and_undo_restores_it()
+    {
+        await using var db = CreateDb();
+        var part = new Part { Ips = "1807581", Name = "Доработка бака, сверление, сварка (КУ260508-Т34-02.010)", Source = "Потребность" };
+        var batch = new DemandBatch { Name = "Потребность" };
+        db.Parts.Add(part);
+        db.DemandItems.Add(new DemandItem { DemandBatch = batch, Part = part, Ips = part.Ips, SourcePartName = part.Name, Quantity = 1, Unit = "шт" });
+        await db.SaveChangesAsync();
+
+        var viewModel = new LibraryViewModel(db, new BlankNormalizationService());
+        await viewModel.LoadCommand.ExecuteAsync(null);
+
+        await viewModel.DeleteLibraryRowsCommand.ExecuteAsync(new[] { viewModel.Rows.Single() });
+
+        viewModel.Rows.Should().BeEmpty();
+        (await db.Parts.AsNoTracking().SingleAsync()).Source.Should().Contain("[ARCHIVED_LIBRARY]");
+        (await db.DemandItems.AsNoTracking().SingleAsync()).PartId.Should().BeNull();
+
+        await UndoCenter.UndoAsync();
+        await viewModel.LoadCommand.ExecuteAsync(null);
+
+        viewModel.Rows.Should().ContainSingle(x => x.Ips == "1807581");
+        (await db.Parts.AsNoTracking().SingleAsync()).Source.Should().Be("Потребность");
+    }
+
+    [Fact]
+    public async Task Library_load_restores_archived_part_when_import_added_active_blank_map()
+    {
+        await using var db = CreateDb();
+        var part = new Part { Ips = "1354749", Designation = "07.053.00.002", Name = "Диск тормозной", Source = "Потребность [ARCHIVED_LIBRARY] test" };
+        var blank = new CanonicalBlank
+        {
+            CanonicalName = "Круг D330 Сталь 40Х",
+            CanonicalKey = "ROUND|D330|40H",
+            BlankType = BlankType.RoundBar,
+            DiameterMm = 330,
+            Material = "Сталь 40Х",
+            BaseUnit = MeasurementUnit.Meter
+        };
+        db.PartBlankMaps.Add(new PartBlankMap { Part = part, CanonicalBlank = blank, ConsumptionQuantity = 0.025m, ConsumptionUnit = MeasurementUnit.Meter, Source = "MskHeaderlessBlankLibrary" });
+        await db.SaveChangesAsync();
+
+        var viewModel = new LibraryViewModel(db, new BlankNormalizationService());
+        await viewModel.LoadAsync();
+
+        viewModel.Rows.Should().ContainSingle(x => x.Ips == "1354749");
+        (await db.Parts.AsNoTracking().SingleAsync()).Source.Should().NotContain("[ARCHIVED_LIBRARY]");
+    }
+
+    [Fact]
+    public async Task Msk_load_joins_msk_records_with_library_by_ips()
+    {
+        await using var db = CreateDb();
+        var part = new Part { Ips = "1335520", Designation = "10.301.05.011", Name = "Адаптер G1/4 - М20х1,5" };
+        var blank = new CanonicalBlank
+        {
+            CanonicalName = "Круг ф 320 сталь 40Х",
+            CanonicalKey = "MSK|ROUND|320|40H",
+            BlankType = BlankType.RoundBar,
+            DiameterMm = 320,
+            Material = "Сталь 40Х",
+            BaseUnit = MeasurementUnit.Meter
+        };
+        db.Parts.Add(part);
+        db.PartBlankMaps.Add(new PartBlankMap { Part = part, CanonicalBlank = blank, ConsumptionQuantity = 0.052m, ConsumptionUnit = MeasurementUnit.Meter, BlankLeadTimeDays = 30, Source = "test" });
+        db.BlankAliases.Add(new BlankAlias { CanonicalBlank = blank, OneCCode = "УТ000004539", SourceName = "Круг ф 320 сталь 40Х", NormalizedSourceName = "Круг ф 320 сталь 40Х", Source = "test" });
+        db.MskRecords.Add(new MskRecord
+        {
+            Ips = "1335520",
+            Designation = "МСК-001",
+            Name = "МСК Адаптер",
+            FileName = @"X:\19_МЕХ УЧАСТОК\База МСК\СПИСОК МСК\test.xlsx",
+            ImportedAt = new DateTime(2026, 7, 23, 8, 0, 0, DateTimeKind.Utc)
+        });
+        await db.SaveChangesAsync();
+
+        var viewModel = new MskViewModel(db, Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+        await viewModel.LoadCommand.ExecuteAsync(null);
+
+        var row = viewModel.Rows.Should().ContainSingle().Subject;
+        row.Ips.Should().Be("1335520");
+        row.HasMsk.Should().Be("Да");
+        row.HasLibraryPart.Should().Be("Да");
+        row.Name.Should().Be("Адаптер G1/4 - М20х1,5");
+        row.BlankType.Should().Be("Круг");
+        row.BlankName.Should().Be("Круг ф 320 сталь 40Х");
+        row.Material.Should().Be("Сталь 40Х");
+        row.OneCCode.Should().Be("УТ000004539");
+        row.ConsumptionQuantity.Should().Be("0,052");
+        row.UnitName.Should().Be("пог. м");
+        row.BlankLeadTimeDays.Should().Be("30");
+        viewModel.SelectedRow = row;
+        viewModel.DetailText.Should().StartWith("IPS: 1335520");
+        viewModel.DetailText.Should().NotContain("\t");
+
+        viewModel.Search = "1335520";
+
+        viewModel.SelectedRow.Should().Be(row);
+        viewModel.DetailText.Should().Contain("Адаптер G1/4 - М20х1,5");
+    }
+
+    [Fact]
+    public async Task Msk_open_drawing_command_retries_bridge_lookup_on_click()
+    {
+        await using var db = CreateDb();
+        db.MskRecords.Add(new MskRecord
+        {
+            Ips = "1320758",
+            Designation = "КПТ-04.00.002А01",
+            Name = "Корпус",
+            FileName = @"X:\19_МЕХ УЧАСТОК\База МСК\СПИСОК МСК\1320758.xlsx",
+            ImportedAt = new DateTime(2026, 7, 27, 8, 0, 0, DateTimeKind.Utc)
+        });
+        await db.SaveChangesAsync();
+        var drawingService = new CountingDrawingService();
+        var viewModel = new MskViewModel(db, Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, drawingService);
+        await viewModel.LoadCommand.ExecuteAsync(null);
+        var row = viewModel.Rows.Single();
+
+        await viewModel.OpenDrawingCommand.ExecuteAsync(row);
+        await viewModel.OpenDrawingCommand.ExecuteAsync(row);
+
+        drawingService.Calls.Should().Be(2);
+        drawingService.Queries.Should().OnlyContain(x => x == "1320758");
+    }
+
+    [Fact]
     public async Task Demand_load_matches_work_in_progress_when_one_c_code_has_leading_zeros()
     {
         await using var db = CreateDb();
@@ -1057,20 +1456,22 @@ public sealed class LibraryViewModelTests
         var alias = new BlankAlias { CanonicalBlank = blank, OneCCode = "UT-SPLIT", SourceName = blank.CanonicalName, NormalizedSourceName = blank.CanonicalName, Source = "1C" };
         var snapshot = new StockSnapshot();
         db.StockItems.AddRange(
-            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 2, Unit = MeasurementUnit.Meter, Warehouse = "ЦМО" },
-            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 5, Unit = MeasurementUnit.Meter, Warehouse = "Основной склад" });
+            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 2, Unit = MeasurementUnit.Meter, Warehouse = "44 секция НЗП (незавершенное производство)" },
+            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 3, Unit = MeasurementUnit.Meter, Warehouse = "Детали МУ в обработке на стороне" },
+            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 5, Unit = MeasurementUnit.Meter, Warehouse = "Основной склад" },
+            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 4, Unit = MeasurementUnit.Meter, Warehouse = "ТМЦ по проекту ФРП" });
         await db.SaveChangesAsync();
 
         var viewModel = new NormalizationViewModel(db, new StubExcelImportService(), new StubFileDialogService());
         await viewModel.LoadCommand.ExecuteAsync(null);
 
         var row = viewModel.Rows.Single(x => x.OneCCode == "UT-SPLIT");
-        row.CmoStockQuantity.Should().Be("2");
-        row.WarehouseStockQuantity.Should().Be("5");
+        row.CmoStockQuantity.Should().Be("5");
+        row.WarehouseStockQuantity.Should().Be("9");
     }
 
     [Fact]
-    public async Task Nsi_usage_finds_parts_by_matching_blank_characteristics_when_internal_blank_ids_differ()
+    public async Task Nsi_usage_does_not_show_parts_from_similar_but_different_blank()
     {
         await using var db = CreateDb();
         var oneCBlank = new CanonicalBlank
@@ -1123,9 +1524,8 @@ public sealed class LibraryViewModelTests
         await viewModel.LoadCommand.ExecuteAsync(null);
         await viewModel.LoadUsageCommand.ExecuteAsync(viewModel.Rows.Single());
 
-        viewModel.UsageRows.Should().ContainSingle();
-        viewModel.UsageRows.Single().Ips.Should().Be("1720202");
-        viewModel.UsageRows.Single().PartName.Should().Contain("Направляющая");
+        viewModel.UsageRows.Should().BeEmpty();
+        viewModel.UsageStatusText.Should().Be("Применяемость не найдена");
     }
 
     [Fact]
@@ -1263,5 +1663,18 @@ public sealed class LibraryViewModelTests
         public Task<ImportReport> ImportDemandAsync(string filePath, IProgress<ImportProgress>? progress, CancellationToken cancellationToken) => Task.FromResult(new ImportReport(0, 0, 0, 0, 0, []));
         public Task<ImportReport> ImportStockAsync(string filePath, IProgress<ImportProgress>? progress, CancellationToken cancellationToken) => Task.FromResult(new ImportReport(0, 0, 0, 0, 0, []));
         public Task<ImportReport> ImportManufacturingBlankLibraryAsync(string filePath, IProgress<ImportProgress>? progress, CancellationToken cancellationToken) => Task.FromResult(new ImportReport(0, 0, 0, 0, 0, []));
+    }
+
+    private sealed class CountingDrawingService : IIpsDrawingService
+    {
+        public int Calls { get; private set; }
+        public List<string> Queries { get; } = [];
+
+        public Task<FileInfo?> FindDrawingPdfAsync(string query, DirectoryInfo outputDirectory, CancellationToken cancellationToken)
+        {
+            Calls++;
+            Queries.Add(query);
+            return Task.FromResult<FileInfo?>(null);
+        }
     }
 }

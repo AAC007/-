@@ -39,22 +39,29 @@ public sealed class BlankDemandCalculationService(
             .ToListAsync(cancellationToken);
 
         var aliasIds = aliases.Select(x => x.Id).ToArray();
+        var aliasKeys = aliases.Select(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode)).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var stocks = stockSnapshotId is null
             ? []
             : await dbContext.StockItems.AsNoTracking()
-                .Where(x => x.StockSnapshotId == stockSnapshotId && x.BlankAliasId != null && aliasIds.Contains(x.BlankAliasId.Value))
+                .Where(x => x.StockSnapshotId == stockSnapshotId)
                 .ToListAsync(cancellationToken);
+        stocks = stocks
+            .Where(x => StockWarehouseRules.IsProductionWarehouse(x.Warehouse))
+            .Where(x => x.BlankAliasId is not null && aliasIds.Contains(x.BlankAliasId.Value) ||
+                aliasKeys.Contains(StockCodeNormalizer.NormalizeForComparison(x.OneCCode)))
+            .ToList();
 
-        var ipsKeys = ipsValues.Select(NormalizeCodeKey).Where(x => x.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var ipsKeys = ipsValues.Select(StockCodeNormalizer.NormalizeForComparison).Where(x => x.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var workInProgressItems = stockSnapshotId is null
             ? new List<StockItem>()
             : await dbContext.StockItems.AsNoTracking()
                 .Where(x => x.StockSnapshotId == stockSnapshotId && x.Unit == MeasurementUnit.Piece)
                 .ToListAsync(cancellationToken);
+        workInProgressItems = workInProgressItems.Where(x => StockWarehouseRules.IsCmoWipWarehouse(x.Warehouse)).ToList();
 
         var workInProgressByIps = workInProgressItems
-            .Where(x => ipsKeys.Contains(NormalizeCodeKey(x.OneCCode)))
-            .GroupBy(x => NormalizeCodeKey(x.OneCCode), StringComparer.OrdinalIgnoreCase)
+            .Where(x => ipsKeys.Contains(StockCodeNormalizer.NormalizeForComparison(x.OneCCode)))
+            .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.Sum(i => i.Quantity), StringComparer.OrdinalIgnoreCase);
 
         var run = new CalculationRun
@@ -109,7 +116,12 @@ public sealed class BlankDemandCalculationService(
                 if (!groups.TryGetValue(key, out var item))
                 {
                     var blankAliases = aliases.Where(x => x.CanonicalBlankId == map.CanonicalBlankId).ToList();
-                    var relatedStock = stocks.Where(s => s.BlankAliasId is not null && blankAliases.Any(a => a.Id == s.BlankAliasId.Value)).ToList();
+                    var blankAliasIds = blankAliases.Select(x => x.Id).ToHashSet();
+                    var blankAliasKeys = blankAliases.Select(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    var relatedStock = stocks
+                        .Where(s => s.BlankAliasId is not null && blankAliasIds.Contains(s.BlankAliasId.Value) ||
+                            blankAliasKeys.Contains(StockCodeNormalizer.NormalizeForComparison(s.OneCCode)))
+                        .ToList();
                     var stockUnitMismatch = relatedStock.Any(s => !unitConversionService.CanSubtract(map.ConsumptionUnit, s.Unit));
                     var stockQuantity = stockUnitMismatch ? 0m : relatedStock.Sum(s => unitConversionService.Convert(s.Quantity, s.Unit, map.ConsumptionUnit, blank));
 
@@ -154,7 +166,7 @@ public sealed class BlankDemandCalculationService(
 
     private static decimal ApplyWorkInProgress(string ips, decimal demandQuantity, IDictionary<string, decimal> workInProgressByIps)
     {
-        var key = NormalizeCodeKey(ips);
+        var key = StockCodeNormalizer.NormalizeForComparison(ips);
         if (!workInProgressByIps.TryGetValue(key, out var inProduction) || inProduction <= 0)
         {
             return demandQuantity;
@@ -163,18 +175,6 @@ public sealed class BlankDemandCalculationService(
         var used = Math.Min(demandQuantity, inProduction);
         workInProgressByIps[key] = inProduction - used;
         return demandQuantity - used;
-    }
-
-    private static string NormalizeCodeKey(string? value)
-    {
-        var text = (value ?? string.Empty).Trim();
-        if (text.Length == 0)
-        {
-            return string.Empty;
-        }
-
-        var withoutLeadingZeros = text.TrimStart('0');
-        return withoutLeadingZeros.Length == 0 ? "0" : withoutLeadingZeros;
     }
 
     private static void AddProblem(CalculationRun run, IDictionary<(long? BlankId, MeasurementUnit Unit, CalculationStatus Status, string Key), CalculationItem> groups, DemandItem demand, CalculationStatus status, string comment)

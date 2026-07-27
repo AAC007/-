@@ -94,6 +94,17 @@ public sealed class MatchedOrderBlankImportProfile : ExcelImportProfileBase
         sheetName.Equals("Библиотека", StringComparison.OrdinalIgnoreCase);
 }
 
+public sealed class MskHeaderlessBlankImportProfile : ExcelImportProfileBase
+{
+    public override string ProfileType => "MskHeaderlessBlankLibrary";
+    protected override IReadOnlyDictionary<string, string[]> Aliases { get; } = new Dictionary<string, string[]>
+    {
+        ["Ips"] = ["IPS"]
+    };
+
+    public override bool CanHandle(string sheetName, IReadOnlyList<string> headers) => false;
+}
+
 public class RotationalBlankImportProfile : ExcelImportProfileBase
 {
     public override string ProfileType => "RotationalBlank";

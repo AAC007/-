@@ -1,9 +1,13 @@
 ﻿using System.Collections;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
@@ -20,6 +24,7 @@ using CommunityToolkit.Mvvm.Input;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
+using OfficeOpenXml;
 
 namespace BlankDemandPlanner.UI.ViewModels;
 
@@ -27,6 +32,7 @@ public sealed partial class MainViewModel : ObservableObject
 {
     private readonly BlankDemandPlannerDbContext _dbContext;
     private readonly IExcelImportService _excelImportService;
+    private readonly IOneCStockSyncService _oneCStockSyncService;
     private readonly IBlankDemandCalculationService _calculationService;
     private readonly IFileDialogService _fileDialogService;
     private readonly ILogger<MainViewModel> _logger;
@@ -37,6 +43,8 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private object? currentPage;
     [ObservableProperty] private string? globalSearch;
     [ObservableProperty] private string undoStatusText = "Отменить";
+    [ObservableProperty] private string stockSyncStatusText = "Остатки 1С: не обновлялись";
+    [ObservableProperty] private bool isStockSyncRunning;
 
     public DashboardViewModel Dashboard { get; }
     public DemandViewModel Demand { get; }
@@ -47,11 +55,12 @@ public sealed partial class MainViewModel : ObservableObject
     public BlankSelectionViewModel BlankSelection { get; }
     public HistoryViewModel History { get; }
     public SettingsViewModel Settings { get; }
-    public SimplePageViewModel Msk { get; }
+    public MskViewModel Msk { get; }
 
     public MainViewModel(
         BlankDemandPlannerDbContext dbContext,
         IExcelImportService excelImportService,
+        IOneCStockSyncService oneCStockSyncService,
         IBlankDemandCalculationService calculationService,
         IBlankNormalizationService normalizationService,
         IReportExportService reportExportService,
@@ -60,6 +69,7 @@ public sealed partial class MainViewModel : ObservableObject
     {
         _dbContext = dbContext;
         _excelImportService = excelImportService;
+        _oneCStockSyncService = oneCStockSyncService;
         _calculationService = calculationService;
         _fileDialogService = fileDialogService;
         _logger = logger;
@@ -73,7 +83,7 @@ public sealed partial class MainViewModel : ObservableObject
         BlankSelection = new BlankSelectionViewModel(dbContext);
         History = new HistoryViewModel();
         Settings = new SettingsViewModel(dbContext);
-        Msk = new SimplePageViewModel("МСК", "Справочник МСК поддерживает таблицу MskRecords и признак HasMsk для IPS.");
+        Msk = new MskViewModel(dbContext, logger, new IpsBridgeDrawingService(), autoOpenDrawings: true);
         UndoCenter.Changed += (_, _) => UndoStatusText = UndoCenter.StatusText;
 
         NavigationItems.Add(new NavigationItem("Главная", Dashboard));
@@ -88,6 +98,7 @@ public sealed partial class MainViewModel : ObservableObject
         SelectedNavigationItem = NavigationItems[0];
         _ = Dashboard.LoadAsync();
         _ = Settings.LoadAsync();
+        _ = SyncStockFromOneCCoreAsync(showMessage: false);
     }
 
     partial void OnSelectedNavigationItemChanged(NavigationItem? value)
@@ -112,6 +123,10 @@ public sealed partial class MainViewModel : ObservableObject
         else if (value?.Page == BlankSelection)
         {
             _ = BlankSelection.LoadAsync();
+        }
+        else if (value?.Page == Msk)
+        {
+            _ = Msk.LoadAsync();
         }
         else if (value?.Page == Normalization)
         {
@@ -155,6 +170,7 @@ public sealed partial class MainViewModel : ObservableObject
         await Stock.LoadAsync();
         await Calculation.LoadLastRunAsync();
         await BlankSelection.LoadAsync();
+        await Msk.LoadAsync();
         await History.LoadAsync();
         await Settings.LoadAsync();
     }
@@ -200,6 +216,54 @@ public sealed partial class MainViewModel : ObservableObject
 
     [RelayCommand]
     private async Task ImportStockAsync() => await ImportAsync("остатков по 1С", file => _excelImportService.ImportStockAsync(file, null, CancellationToken.None));
+
+    [RelayCommand]
+    private async Task SyncStockFromOneCAsync() => await SyncStockFromOneCCoreAsync(showMessage: true);
+
+    private async Task SyncStockFromOneCCoreAsync(bool showMessage)
+    {
+        if (IsStockSyncRunning)
+        {
+            return;
+        }
+
+        IsStockSyncRunning = true;
+        StockSyncStatusText = "Остатки 1С: обновление...";
+        try
+        {
+            var report = await _oneCStockSyncService.SyncAsync(CancellationToken.None);
+            _dbContext.ChangeTracker.Clear();
+            await Dashboard.LoadAsync();
+            await Demand.LoadAsync();
+            await Normalization.LoadAsync();
+            await Stock.LoadAsync();
+            await Calculation.LoadLastRunAsync();
+            StockSyncStatusText = $"Остатки 1С обновлены: {report.SyncedAt.ToLocalTime():dd.MM.yyyy HH:mm}; склад: {report.WarehouseRows}; НЗП/ЦМО: {report.WipRows}";
+            if (showMessage)
+            {
+                MessageBox.Show($"Остатки 1С обновлены.\nСклад: {report.WarehouseRows} строк\nНЗП/ЦМО: {report.WipRows} строк\nДата: {report.SyncedAt.ToLocalTime():dd.MM.yyyy HH:mm}", "Обновление данных 1С", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "1C stock sync failed");
+            var lastStock = await _dbContext.StockSnapshots.AsNoTracking()
+                .OrderByDescending(x => x.ImportedAt)
+                .Select(x => (DateTime?)x.ImportedAt)
+                .FirstOrDefaultAsync();
+            StockSyncStatusText = lastStock is null
+                ? "Остатки 1С не обновлены"
+                : $"Остатки 1С не обновлены; последний снимок {lastStock.Value.ToLocalTime():dd.MM.yyyy HH:mm}";
+            if (showMessage)
+            {
+                MessageBox.Show($"Не удалось обновить остатки из 1С.\n{ex.GetBaseException().Message}\nПредыдущие остатки сохранены.", "Обновление данных 1С", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+        finally
+        {
+            IsStockSyncRunning = false;
+        }
+    }
 
     [RelayCommand]
     private async Task CalculateAsync()
@@ -287,18 +351,25 @@ public sealed partial class MainViewModel : ObservableObject
             CurrentPage = item.Page;
         }
     }
+
+    [RelayCommand]
+    private async Task NavigateToNsiDuplicatesAsync()
+    {
+        Normalization.DuplicatesOnly = true;
+        await Normalization.LoadAsync();
+        NavigateTo(Normalization);
+    }
 }
 
 public sealed record NavigationItem(string Title, object Page);
 
 public sealed partial class DashboardViewModel(BlankDemandPlannerDbContext dbContext) : ObservableObject
 {
-    public string LastSoftwareUpdate { get; } = "22.07.2026, версия v2026.07.22.1";
+    public string LastSoftwareUpdate { get; } = "27.07.2026, версия v2026.07.27.3";
     public string DeveloperInfo { get; } = "Разработал Codex с участием Аракеляна А.С.";
 
     [ObservableProperty] private int parts;
     [ObservableProperty] private int canonicalBlanks;
-    [ObservableProperty] private int oneCPositions;
     [ObservableProperty] private int partsWithoutBlank;
     [ObservableProperty] private int partsWithoutMsk;
     [ObservableProperty] private int duplicateCandidates;
@@ -310,14 +381,31 @@ public sealed partial class DashboardViewModel(BlankDemandPlannerDbContext dbCon
 
     public async Task LoadAsync()
     {
-        Parts = await dbContext.Parts.AsNoTracking().CountAsync();
-        CanonicalBlanks = await dbContext.CanonicalBlanks.AsNoTracking().CountAsync();
-        OneCPositions = await dbContext.BlankAliases.AsNoTracking().CountAsync();
-        PartsWithoutBlank = await dbContext.Parts.AsNoTracking().CountAsync(p => !p.BlankMaps.Any(m => m.IsActive));
-        PartsWithoutMsk = await dbContext.Parts.AsNoTracking().CountAsync(p => !p.HasMsk);
-        DuplicateCandidates = await dbContext.BlankAliases.AsNoTracking().GroupBy(x => x.NormalizedSourceName).CountAsync(g => g.Count() > 1);
-        OutsideI012 = await dbContext.CanonicalBlanks.AsNoTracking().CountAsync(x => x.I012Status != I012Status.Allowed);
-        PurchasePositions = await dbContext.CalculationItems.AsNoTracking().CountAsync(x => x.PurchaseQuantity > 0);
+        var activeParts = dbContext.Parts.AsNoTracking()
+            .Where(x => x.Source == null || !x.Source.Contains("[ARCHIVED_LIBRARY]"));
+        var activeAliases = dbContext.BlankAliases.AsNoTracking()
+            .Where(x => x.IsActive && x.CanonicalBlank != null && x.CanonicalBlank.IsActive);
+
+        Parts = await activeParts.CountAsync();
+        CanonicalBlanks = await activeAliases.CountAsync();
+        PartsWithoutBlank = await activeParts.CountAsync(p => !p.BlankMaps.Any(m => m.IsActive));
+        PartsWithoutMsk = await activeParts.CountAsync(p => !p.HasMsk);
+        var duplicateCounts = await activeAliases
+            .Where(x => x.NormalizedSourceName != "")
+            .GroupBy(x => x.NormalizedSourceName)
+            .Where(g => g.Count() > 1)
+            .Select(g => g.Count())
+            .ToListAsync();
+        DuplicateCandidates = duplicateCounts.Sum();
+        OutsideI012 = await activeAliases.CountAsync(x => x.CanonicalBlank != null && x.CanonicalBlank.I012Status != I012Status.Allowed);
+
+        var latestCalculationRunId = await dbContext.CalculationRuns.AsNoTracking()
+            .OrderByDescending(x => x.StartedAt)
+            .Select(x => (long?)x.Id)
+            .FirstOrDefaultAsync();
+        PurchasePositions = latestCalculationRunId is null
+            ? 0
+            : await dbContext.CalculationItems.AsNoTracking().CountAsync(x => x.CalculationRunId == latestCalculationRunId && x.PurchaseQuantity > 0);
 
         var demand = await dbContext.DemandBatches.AsNoTracking().OrderByDescending(x => x.ImportedAt).Select(x => (DateTime?)x.ImportedAt).FirstOrDefaultAsync();
         var stock = await dbContext.StockSnapshots.AsNoTracking().OrderByDescending(x => x.ImportedAt).Select(x => (DateTime?)x.ImportedAt).FirstOrDefaultAsync();
@@ -514,12 +602,13 @@ public sealed partial class DemandViewModel(BlankDemandPlannerDbContext dbContex
             .Where(x => string.Equals(x.Ips, row.Ips, StringComparison.OrdinalIgnoreCase))
             .ToList();
         var totalQuantity = details.Sum(x => TryParseDisplayQuantity(x.Quantity, out var quantity) ? quantity : 0m);
-        DetailTitle = $"Детализация IPS {row.Ips}; всего деталей: {FormatDecimal(totalQuantity)}";
+        var totalInProduction = details.Sum(x => TryParseDisplayQuantity(x.InProductionQuantity, out var quantity) ? quantity : 0m);
+        var deficit = Math.Max(0m, totalQuantity - totalInProduction);
+        DetailTitle = $"Детализация IPS {row.Ips}; всего деталей: {FormatDecimal(totalQuantity)}; дефицит: {FormatDecimal(deficit)}";
         foreach (var detail in details
             .Select(x => new DemandDetailRow(
                 x.DemandDate,
                 x.Quantity,
-                x.WorkInProgressBefore,
                 x.InProductionQuantity,
                 x.WorkInProgressAfter,
                 x.Project,
@@ -623,43 +712,32 @@ public sealed partial class DemandViewModel(BlankDemandPlannerDbContext dbContex
             return new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
         }
 
-        var ipsKeys = ipsValues.Select(NormalizeCodeKey).Where(x => x.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var ipsKeys = ipsValues.Select(StockCodeNormalizer.NormalizeForComparison).Where(x => x.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var stockItems = await dbContext.StockItems.AsNoTracking()
             .Where(x => x.StockSnapshotId == latestSnapshotId.Value && x.Unit == MeasurementUnit.Piece)
             .ToListAsync();
 
         return stockItems
-            .Where(x => ipsKeys.Contains(NormalizeCodeKey(x.OneCCode)))
-            .GroupBy(x => NormalizeCodeKey(x.OneCCode), StringComparer.OrdinalIgnoreCase)
+            .Where(x => StockWarehouseRules.IsCmoWipWarehouse(x.Warehouse) && ipsKeys.Contains(StockCodeNormalizer.NormalizeForComparison(x.OneCCode)))
+            .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.Sum(i => i.Quantity), StringComparer.OrdinalIgnoreCase);
     }
 
     private static decimal ApplyWorkInProgress(string ips, decimal demandQuantity, IDictionary<string, decimal> workInProgressByIps)
     {
-        if (!workInProgressByIps.TryGetValue(NormalizeCodeKey(ips), out var inProduction) || inProduction <= 0)
+        var key = StockCodeNormalizer.NormalizeForComparison(ips);
+        if (!workInProgressByIps.TryGetValue(key, out var inProduction) || inProduction <= 0)
         {
             return 0m;
         }
 
         var used = Math.Min(demandQuantity, inProduction);
-        workInProgressByIps[NormalizeCodeKey(ips)] = inProduction - used;
+        workInProgressByIps[key] = inProduction - used;
         return used;
     }
 
     private static decimal WorkInProgressBefore(string ips, IDictionary<string, decimal> workInProgressByIps) =>
-        workInProgressByIps.TryGetValue(NormalizeCodeKey(ips), out var value) ? Math.Max(0m, value) : 0m;
-
-    private static string NormalizeCodeKey(string? value)
-    {
-        var text = UiText.Clean(value).Trim();
-        if (text.Length == 0)
-        {
-            return string.Empty;
-        }
-
-        var withoutLeadingZeros = text.TrimStart('0');
-        return withoutLeadingZeros.Length == 0 ? "0" : withoutLeadingZeros;
-    }
+        workInProgressByIps.TryGetValue(StockCodeNormalizer.NormalizeForComparison(ips), out var value) ? Math.Max(0m, value) : 0m;
 
     private static bool TryParseQuantity(string? value, out decimal quantity)
     {
@@ -937,9 +1015,11 @@ public sealed partial class LibraryViewModel(
     [RelayCommand]
     public async Task LoadAsync()
     {
+        await RestoreImportedArchivedLibraryPartsAsync();
         await EnsureDemandPartsInLibraryAsync();
 
         var query = dbContext.Parts.AsNoTracking()
+            .Where(x => x.Source == null || !x.Source.Contains("[ARCHIVED_LIBRARY]"))
             .AsQueryable();
         if (!string.IsNullOrWhiteSpace(Search))
         {
@@ -1014,6 +1094,27 @@ public sealed partial class LibraryViewModel(
 
         SummaryText = $"Деталей: {Rows.Select(x => x.PartId).Distinct().Count()}; без заготовки: {Rows.Count(x => x.PartBlankMapId is null || x.CanonicalBlankId is null)}";
         await LoadBlankSuggestionsAsync();
+    }
+
+    private async Task RestoreImportedArchivedLibraryPartsAsync()
+    {
+        var parts = await dbContext.Parts
+            .Where(x => x.Source != null &&
+                x.Source.Contains("[ARCHIVED_LIBRARY]") &&
+                x.BlankMaps.Any(m => m.IsActive))
+            .ToListAsync();
+        if (parts.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var part in parts)
+        {
+            part.Source = RestoreLibrarySource(part.Source);
+            part.UpdatedAt = DateTime.UtcNow;
+        }
+
+        await dbContext.SaveChangesAsync();
     }
 
     private async Task EnsureDemandPartsInLibraryAsync()
@@ -1371,7 +1472,7 @@ public sealed partial class LibraryViewModel(
             return;
         }
 
-        var snapshot = await SnapshotLibraryMapsAsync(rows);
+        var snapshot = await SnapshotLibraryAsync(rows);
         foreach (var row in rows.DistinctBy(x => new { x.PartId, x.PartBlankMapId }))
         {
             await ArchiveLibraryRowAsync(row, reload: false);
@@ -1380,24 +1481,29 @@ public sealed partial class LibraryViewModel(
         EditorStatus = rows.Count == 1
             ? $"Удалена или архивирована строка библиотеки: {rows[0].Ips}."
             : $"Удалено или архивировано строк библиотеки: {rows.Count}.";
-        UndoCenter.Push("Отмена удаления из библиотеки", async () => await RestoreLibraryMapsAsync(snapshot));
+        UndoCenter.Push("Отмена удаления из библиотеки", async () => await RestoreLibraryAsync(snapshot));
         await LoadAsync();
     }
 
-    private async Task<List<LibraryMapSnapshot>> SnapshotLibraryMapsAsync(IEnumerable<LibraryRow> rows)
+    private async Task<LibraryDeleteSnapshot> SnapshotLibraryAsync(IEnumerable<LibraryRow> rows)
     {
         var partIds = rows.Select(x => x.PartId).Distinct().ToArray();
-        return await dbContext.PartBlankMaps.AsNoTracking()
+        var maps = await dbContext.PartBlankMaps.AsNoTracking()
             .Where(x => partIds.Contains(x.PartId))
             .Select(x => new LibraryMapSnapshot(x.Id, x.IsActive, x.IsPrimary, x.UpdatedAt))
             .ToListAsync();
+        var parts = await dbContext.Parts.AsNoTracking()
+            .Where(x => partIds.Contains(x.Id))
+            .Select(x => new LibraryPartSnapshot(x.Id, x.Source, x.UpdatedAt))
+            .ToListAsync();
+        return new LibraryDeleteSnapshot(maps, parts);
     }
 
-    private async Task RestoreLibraryMapsAsync(List<LibraryMapSnapshot> snapshot)
+    private async Task RestoreLibraryAsync(LibraryDeleteSnapshot snapshot)
     {
-        var ids = snapshot.Select(x => x.Id).ToArray();
+        var ids = snapshot.Maps.Select(x => x.Id).ToArray();
         var maps = await dbContext.PartBlankMaps.Where(x => ids.Contains(x.Id)).ToListAsync();
-        foreach (var saved in snapshot)
+        foreach (var saved in snapshot.Maps)
         {
             var map = maps.FirstOrDefault(x => x.Id == saved.Id);
             if (map is null)
@@ -1408,6 +1514,20 @@ public sealed partial class LibraryViewModel(
             map.IsActive = saved.IsActive;
             map.IsPrimary = saved.IsPrimary;
             map.UpdatedAt = saved.UpdatedAt;
+        }
+
+        var partIds = snapshot.Parts.Select(x => x.Id).ToArray();
+        var parts = await dbContext.Parts.Where(x => partIds.Contains(x.Id)).ToListAsync();
+        foreach (var saved in snapshot.Parts)
+        {
+            var part = parts.FirstOrDefault(x => x.Id == saved.Id);
+            if (part is null)
+            {
+                continue;
+            }
+
+            part.Source = saved.Source;
+            part.UpdatedAt = saved.UpdatedAt;
         }
 
         await dbContext.SaveChangesAsync();
@@ -1478,7 +1598,7 @@ public sealed partial class LibraryViewModel(
                 map.UpdatedAt = DateTime.UtcNow;
             }
         }
-        else if (!part.BlankMaps.Any())
+        else if (row.CanonicalBlankId is null)
         {
             var demandItems = await dbContext.DemandItems.Where(x => x.PartId == part.Id).ToListAsync();
             foreach (var demandItem in demandItems)
@@ -1486,8 +1606,9 @@ public sealed partial class LibraryViewModel(
                 demandItem.PartId = null;
             }
 
-            dbContext.Parts.Remove(part);
-            EditorStatus = $"Удалена деталь без заготовки: {row.Ips}.";
+            part.Source = BuildArchivedSource(part.Source, "Удалено из библиотеки");
+            part.UpdatedAt = DateTime.UtcNow;
+            EditorStatus = $"Деталь без заготовки убрана из библиотеки: {row.Ips}.";
             await dbContext.SaveChangesAsync();
             if (reload)
             {
@@ -1519,6 +1640,11 @@ public sealed partial class LibraryViewModel(
     private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) ?? string.Empty;
     private static bool IsDemandLibraryPartCandidate(DemandItem item)
     {
+        if (IsArchivedLibrarySource(item.Part?.Source))
+        {
+            return false;
+        }
+
         var unit = UiText.Clean(item.Unit).Trim();
         if (!string.IsNullOrWhiteSpace(unit) && !unit.Contains("шт", StringComparison.OrdinalIgnoreCase))
         {
@@ -1543,6 +1669,26 @@ public sealed partial class LibraryViewModel(
 
         var (designation, partName) = SplitDesignationAndName(name);
         return !string.IsNullOrWhiteSpace(designation) && !string.IsNullOrWhiteSpace(partName);
+    }
+
+    private static bool IsArchivedLibrarySource(string? source) =>
+        !string.IsNullOrWhiteSpace(source) && source.Contains("[ARCHIVED_LIBRARY]", StringComparison.OrdinalIgnoreCase);
+
+    private static string? RestoreLibrarySource(string? source)
+    {
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            return source;
+        }
+
+        var restored = source.Replace("[ARCHIVED_LIBRARY]", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
+        return string.IsNullOrWhiteSpace(restored) ? null : restored;
+    }
+
+    private static string BuildArchivedSource(string? source, string reason)
+    {
+        var marker = $"[ARCHIVED_LIBRARY] {reason} {DateTime.UtcNow:yyyy-MM-dd HH:mm}";
+        return string.IsNullOrWhiteSpace(source) ? marker : $"{source}; {marker}";
     }
 
     private static (string? Designation, string Name) SplitDesignationAndName(string? value)
@@ -1625,6 +1771,7 @@ public sealed partial class NormalizationViewModel(
     [ObservableProperty] private DisplayOption<BlankType?> selectedBlankTypeFilter = UiText.BlankTypeFiltersWithUnknown[0];
     [ObservableProperty] private string sizeFilter = string.Empty;
     [ObservableProperty] private string materialFilter = string.Empty;
+    [ObservableProperty] private bool duplicatesOnly;
     [ObservableProperty] private string statusText = string.Empty;
     [ObservableProperty] private NsiBlankRow? selectedRow;
     [ObservableProperty] private DisplayOption<BlankType> editBlankType = UiText.BlankTypes.First(x => x.Value == BlankType.Unknown);
@@ -1645,6 +1792,7 @@ public sealed partial class NormalizationViewModel(
     partial void OnSelectedBlankTypeFilterChanged(DisplayOption<BlankType?> value) => _ = LoadAsync();
     partial void OnSizeFilterChanged(string value) => _ = LoadAsync();
     partial void OnMaterialFilterChanged(string value) => _ = LoadAsync();
+    partial void OnDuplicatesOnlyChanged(bool value) => _ = LoadAsync();
     partial void OnEditMaterialChanged(string value) => _ = LoadMaterialSuggestionsAsync(value);
     partial void OnSelectedRowChanged(NsiBlankRow? value) => _ = LoadUsageAsync(value);
     partial void OnStatusTextChanged(string value)
@@ -2144,6 +2292,17 @@ public sealed partial class NormalizationViewModel(
             }
         }
 
+        if (DuplicatesOnly)
+        {
+            var duplicateNames = await dbContext.BlankAliases.AsNoTracking()
+                .Where(x => x.IsActive && x.CanonicalBlank != null && x.CanonicalBlank.IsActive && x.NormalizedSourceName != "")
+                .GroupBy(x => x.NormalizedSourceName)
+                .Where(g => g.Count() > 1)
+                .Select(g => g.Key)
+                .ToListAsync();
+            query = query.Where(x => duplicateNames.Contains(x.NormalizedSourceName));
+        }
+
         var aliases = await query
             .OrderBy(x => x.OneCCode)
             .ToListAsync();
@@ -2160,15 +2319,15 @@ public sealed partial class NormalizationViewModel(
                 .ToListAsync();
 
         var cmoStockByCode = stockItems
-            .Where(x => IsCmoWarehouse(x.Warehouse))
-            .GroupBy(x => x.OneCCode, StringComparer.OrdinalIgnoreCase)
+            .Where(x => StockWarehouseRules.IsCmoWipWarehouse(x.Warehouse))
+            .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(
                 x => x.Key,
                 x => (Quantity: x.Sum(i => i.Quantity), Unit: x.Select(i => i.Unit).FirstOrDefault()),
                 StringComparer.OrdinalIgnoreCase);
         var warehouseStockByCode = stockItems
-            .Where(x => !IsCmoWarehouse(x.Warehouse))
-            .GroupBy(x => x.OneCCode, StringComparer.OrdinalIgnoreCase)
+            .Where(x => StockWarehouseRules.IsProductionWarehouse(x.Warehouse))
+            .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(
                 x => x.Key,
                 x => (Quantity: x.Sum(i => i.Quantity), Unit: x.Select(i => i.Unit).FirstOrDefault()),
@@ -2181,8 +2340,9 @@ public sealed partial class NormalizationViewModel(
             var unit = blank is null
                 ? MeasurementUnit.Piece
                 : MeterBasedBlankTypes.Contains(blank.BlankType) ? MeasurementUnit.Meter : blank.BaseUnit;
-            var hasCmoStock = cmoStockByCode.TryGetValue(alias.OneCCode, out var cmoStock);
-            var hasWarehouseStock = warehouseStockByCode.TryGetValue(alias.OneCCode, out var warehouseStock);
+            var stockCodeKey = StockCodeNormalizer.NormalizeForComparison(alias.OneCCode);
+            var hasCmoStock = cmoStockByCode.TryGetValue(stockCodeKey, out var cmoStock);
+            var hasWarehouseStock = warehouseStockByCode.TryGetValue(stockCodeKey, out var warehouseStock);
             Rows.Add(new NsiBlankRow(
                 alias.Id,
                 alias.CanonicalBlankId,
@@ -2212,12 +2372,6 @@ public sealed partial class NormalizationViewModel(
         await LoadMaterialSuggestionsAsync(EditMaterial);
     }
 
-    private static bool IsCmoWarehouse(string? warehouse)
-    {
-        var text = UiText.Clean(warehouse).Trim();
-        return text.Length == 0 || text.Contains("ЦМО", StringComparison.OrdinalIgnoreCase);
-    }
-
     [RelayCommand]
     private async Task LoadUsageAsync(NsiBlankRow? row)
     {
@@ -2232,7 +2386,7 @@ public sealed partial class NormalizationViewModel(
             .Include(x => x.Part)
             .Include(x => x.CanonicalBlank)
             .ThenInclude(x => x!.Aliases)
-            .Where(x => x.IsActive)
+            .Where(x => x.IsActive && x.Part != null && (x.Part.Source == null || !x.Part.Source.Contains("[ARCHIVED_LIBRARY]")))
             .ToListAsync();
 
         maps = maps
@@ -2456,43 +2610,7 @@ public sealed partial class NormalizationViewModel(
 
     private static bool IsUsageMatch(PartBlankMap map, NsiBlankRow row)
     {
-        var blank = map.CanonicalBlank;
-        if (blank is null)
-        {
-            return false;
-        }
-
-        if (map.CanonicalBlankId == row.CanonicalBlankId)
-        {
-            return true;
-        }
-
-        if (blank.Aliases.Any(x => string.Equals(x.OneCCode, row.OneCCode, StringComparison.OrdinalIgnoreCase)))
-        {
-            return true;
-        }
-
-        var blankSize = FormatSize(blank);
-        if (!string.IsNullOrWhiteSpace(row.Size) &&
-            string.Equals(blankSize, row.Size, StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(NormalizeKey(blank.Material), NormalizeKey(row.Material), StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        var blankName = NormalizeKey(blank.CanonicalName);
-        var sourceName = NormalizeKey(row.SourceName);
-        var rowBlankName = NormalizeKey(row.BlankName);
-        if (!string.IsNullOrWhiteSpace(blankName) &&
-            (blankName == sourceName || blankName == rowBlankName || sourceName.Contains(blankName, StringComparison.Ordinal) || blankName.Contains(sourceName, StringComparison.Ordinal)))
-        {
-            return true;
-        }
-
-        return blank.Aliases
-            .Select(x => NormalizeKey(x.SourceName))
-            .Where(x => !string.IsNullOrWhiteSpace(x))
-            .Any(x => x == sourceName || x == rowBlankName || sourceName.Contains(x, StringComparison.Ordinal) || x.Contains(sourceName, StringComparison.Ordinal));
+        return map.CanonicalBlankId == row.CanonicalBlankId;
     }
 
     private static string NormalizeKey(string? value) => UiText.Clean(value)
@@ -2605,8 +2723,1164 @@ public sealed partial class StockViewModel(BlankDemandPlannerDbContext dbContext
     private static string FormatDecimal(decimal quantity) => quantity.ToString("0.####", CultureInfo.GetCultureInfo("ru-RU"));
 }
 
+public sealed partial class MskViewModel(
+    BlankDemandPlannerDbContext dbContext,
+    ILogger logger,
+    IIpsDrawingService? ipsDrawingService = null,
+    bool autoOpenDrawings = false) : ObservableObject
+{
+    private const string DefaultMskFolder = @"X:\19_МЕХ УЧАСТОК\База МСК\СПИСОК МСК";
+
+    private readonly List<MskLibraryRow> allRows = [];
+    private readonly IIpsDrawingService drawingService = ipsDrawingService ?? new IpsBridgeDrawingService();
+    private readonly HashSet<string> attemptedDrawingIps = new(StringComparer.OrdinalIgnoreCase);
+
+    public ObservableCollection<MskLibraryRow> Rows { get; } = [];
+
+    [ObservableProperty] private string search = string.Empty;
+    [ObservableProperty] private string statusText = "МСК не загружены.";
+    [ObservableProperty] private MskLibraryRow? selectedRow;
+    [ObservableProperty] private string detailText = "Выберите деталь для просмотра МСК.";
+    [ObservableProperty] private bool isBusy;
+
+    partial void OnSearchChanged(string value) => ApplyFilter();
+
+    partial void OnSelectedRowChanged(MskLibraryRow? value)
+    {
+        DetailText = value is null
+            ? "Выберите деталь для просмотра МСК."
+            : BuildDetailText(value);
+        if (value is not null && autoOpenDrawings)
+        {
+            _ = TryOpenDrawingAsync(value, forceRetry: false);
+        }
+    }
+
+    [RelayCommand]
+    public async Task LoadAsync()
+    {
+        await LoadFromDatabaseAsync();
+    }
+
+    [RelayCommand]
+    private async Task RefreshFromFolderAsync()
+    {
+        if (IsBusy)
+        {
+            return;
+        }
+
+        IsBusy = true;
+        try
+        {
+            ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
+            if (!Directory.Exists(DefaultMskFolder))
+            {
+                StatusText = $"Папка МСК недоступна: {DefaultMskFolder}";
+                return;
+            }
+
+            var files = Directory.EnumerateFiles(DefaultMskFolder, "*.xls*", SearchOption.AllDirectories)
+                .Where(IsSupportedExcelFile)
+                .OrderBy(x => x)
+                .ToList();
+            var records = new List<MskRecord>();
+            var errors = 0;
+            foreach (var file in files)
+            {
+                try
+                {
+                    var record = ReadMskRecord(file);
+                    if (!string.IsNullOrWhiteSpace(record.Ips))
+                    {
+                        records.Add(record);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errors++;
+                    logger.LogWarning(ex, "Could not read MSK file {File}", file);
+                }
+            }
+
+            var latestByIps = records
+                .GroupBy(x => x.Ips, StringComparer.OrdinalIgnoreCase)
+                .Select(x => x.OrderByDescending(r => File.Exists(r.FileName) ? File.GetLastWriteTime(r.FileName) : DateTime.MinValue).First())
+                .ToList();
+
+            var existing = await dbContext.MskRecords.ToListAsync();
+            dbContext.MskRecords.RemoveRange(existing);
+            await dbContext.SaveChangesAsync();
+
+            dbContext.MskRecords.AddRange(latestByIps);
+
+            var parts = await dbContext.Parts.ToListAsync();
+            var mskIps = latestByIps.Select(x => x.Ips).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var part in parts)
+            {
+                part.HasMsk = mskIps.Contains(part.Ips);
+                part.UpdatedAt = DateTime.UtcNow;
+            }
+
+            await dbContext.SaveChangesAsync();
+            await LoadFromDatabaseAsync();
+            StatusText = $"МСК обновлены из X: файлов {files.Count}, записей {latestByIps.Count}, ошибок чтения {errors}.";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    [RelayCommand]
+    private void OpenSelectedMsk()
+    {
+        var row = SelectedRow ?? ResolveRowFromSearch();
+        if (row is null || string.IsNullOrWhiteSpace(row.FilePath))
+        {
+            StatusText = "Выберите строку с файлом МСК.";
+            return;
+        }
+
+        if (!File.Exists(row.FilePath))
+        {
+            StatusText = $"Файл МСК не найден: {row.FilePath}";
+            return;
+        }
+
+        SelectedRow = row;
+        Process.Start(new ProcessStartInfo(row.FilePath) { UseShellExecute = true });
+        StatusText = $"Открыт файл МСК: {row.FilePath}";
+    }
+
+    [RelayCommand]
+    private async Task OpenDrawingAsync(object? parameter)
+    {
+        var row = parameter as MskLibraryRow ?? SelectedRow ?? ResolveRowFromSearch();
+        if (row is null)
+        {
+            StatusText = "Выберите строку МСК для открытия чертежа.";
+            return;
+        }
+
+        SelectedRow = row;
+        await TryOpenDrawingAsync(row, forceRetry: true);
+    }
+
+    private async Task LoadFromDatabaseAsync()
+    {
+        var parts = await dbContext.Parts.AsNoTracking()
+            .Include(x => x.BlankMaps.Where(m => m.IsActive))
+            .ThenInclude(x => x.CanonicalBlank)
+            .ThenInclude(x => x!.Aliases)
+            .Where(x => x.Source == null || !x.Source.Contains("[ARCHIVED_LIBRARY]"))
+            .AsSplitQuery()
+            .ToListAsync();
+        var records = await dbContext.MskRecords.AsNoTracking().ToListAsync();
+        var mskDetails = LoadMskDetailsFromReport();
+        var recordsByIps = records
+            .GroupBy(x => x.Ips, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.OrderByDescending(r => r.ImportedAt).First(), StringComparer.OrdinalIgnoreCase);
+        var partsByIps = parts
+            .GroupBy(x => x.Ips, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.OrderByDescending(p => p.UpdatedAt).First(), StringComparer.OrdinalIgnoreCase);
+
+        allRows.Clear();
+        foreach (var ips in partsByIps.Keys.Concat(recordsByIps.Keys).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x))
+        {
+            partsByIps.TryGetValue(ips, out var part);
+            recordsByIps.TryGetValue(ips, out var record);
+            var detail = ResolveMskDetail(record, mskDetails);
+            var map = part?.BlankMaps.FirstOrDefault(x => x.IsActive && x.IsPrimary) ?? part?.BlankMaps.FirstOrDefault(x => x.IsActive);
+            var blank = map?.CanonicalBlank;
+            var alias = blank?.Aliases.FirstOrDefault(x => x.IsActive) ?? blank?.Aliases.FirstOrDefault();
+            var unit = map?.ConsumptionUnit is null ? string.Empty : UiText.DisplayUnit(map.ConsumptionUnit);
+            allRows.Add(new MskLibraryRow(
+                ips,
+                UiText.Clean(part?.Designation ?? record?.Designation),
+                UiText.Clean(FirstNotEmpty(part?.Name, record?.Name)),
+                record is null ? "Нет" : "Да",
+                part is null ? "Нет" : "Да",
+                record?.FileName ?? string.Empty,
+                File.Exists(record?.FileName) ? Path.GetFileName(record!.FileName) : string.Empty,
+                record?.ImportedAt.ToLocalTime().ToString("g") ?? string.Empty,
+                FirstNotEmpty(blank is null ? null : UiText.DisplayBlankType(blank.BlankType), detail?.BlankType),
+                FirstNotEmpty(UiText.Clean(alias?.SourceName ?? blank?.CanonicalName), detail?.BlankName),
+                FirstNotEmpty(UiText.Clean(blank?.Material), detail?.Material),
+                FirstNotEmpty(alias?.OneCCode, detail?.OneCCode),
+                map is null ? detail?.ConsumptionQuantity ?? string.Empty : FormatDecimal(map.ConsumptionQuantity),
+                FirstNotEmpty(unit, detail?.UnitName),
+                (map?.BlankLeadTimeDays ?? 30).ToString(CultureInfo.InvariantCulture)));
+        }
+
+        ApplyFilter();
+        StatusText = allRows.Count == 0
+            ? "МСК еще не загружены. Нажмите \"Обновить данные МСК\"."
+            : $"Показано {Rows.Count} из {allRows.Count}; записей МСК: {records.Count}.";
+    }
+
+    private void ApplyFilter()
+    {
+        var searchValue = UiText.Clean(Search).Trim();
+        var filtered = string.IsNullOrWhiteSpace(searchValue)
+            ? allRows
+            : allRows.Where(x =>
+                x.Ips.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
+                x.Designation.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
+                x.Name.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
+                x.BlankType.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
+                x.BlankName.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
+                x.Material.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
+                x.OneCCode.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
+                x.FileName.Contains(searchValue, StringComparison.OrdinalIgnoreCase)).ToList();
+
+        Rows.Clear();
+        foreach (var row in filtered.Take(1000))
+        {
+            Rows.Add(row);
+        }
+
+        SelectedRow = ResolvePreferredRow(searchValue);
+        StatusText = $"Показано {Rows.Count} из {allRows.Count}.";
+    }
+
+    private MskLibraryRow? ResolvePreferredRow(string searchValue)
+    {
+        if (Rows.Count == 0)
+        {
+            return null;
+        }
+
+        if (Rows.Count == 1)
+        {
+            return Rows[0];
+        }
+
+        if (SelectedRow is not null && Rows.Contains(SelectedRow))
+        {
+            return SelectedRow;
+        }
+
+        return string.IsNullOrWhiteSpace(searchValue)
+            ? Rows[0]
+            : Rows.FirstOrDefault(x => string.Equals(x.Ips, searchValue, StringComparison.OrdinalIgnoreCase)) ?? Rows[0];
+    }
+
+    private static MskRecord ReadMskRecord(string filePath)
+    {
+        using var package = new ExcelPackage(new FileInfo(filePath));
+        var sheet = package.Workbook.Worksheets.FirstOrDefault()
+            ?? throw new InvalidOperationException("В книге МСК нет листов.");
+        var ips = CleanMskCell(sheet.Cells["C5"].Text);
+        var designation = CleanMskCell(sheet.Cells["E5"].Text);
+        var name = CleanMskCell(sheet.Cells["L5"].Text);
+
+        if (string.IsNullOrWhiteSpace(ips))
+        {
+            ips = Path.GetFileNameWithoutExtension(filePath);
+        }
+
+        return new MskRecord
+        {
+            Ips = ips,
+            Designation = designation,
+            Name = string.IsNullOrWhiteSpace(name) ? Path.GetFileNameWithoutExtension(filePath) : name,
+            FileName = filePath,
+            ImportedAt = DateTime.UtcNow
+        };
+    }
+
+    private static bool IsSupportedExcelFile(string filePath)
+    {
+        var extension = Path.GetExtension(filePath);
+        return extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".xlsm", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string CleanMskCell(string? value) => UiText.Clean(value).Trim();
+
+    private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) ?? string.Empty;
+
+    private static string BuildDetailText(MskLibraryRow row) =>
+        $"IPS: {row.Ips}\n" +
+        $"Обозначение: {row.Designation}\n" +
+        $"Наименование: {row.Name}\n" +
+        $"Вид заготовки: {row.BlankType}\n" +
+        $"Заготовка: {row.BlankName}\n" +
+        $"Материал: {row.Material}\n" +
+        $"Код УТ: {row.OneCCode}\n" +
+        $"Норма расхода: {row.ConsumptionQuantity} {row.UnitName}\n" +
+        $"Срок заготовки, дней: {row.BlankLeadTimeDays}\n" +
+        $"Есть в библиотеке: {row.HasLibraryPart}\n" +
+        $"Есть МСК: {row.HasMsk}\n" +
+        $"Файл: {row.FilePath}";
+
+    private async Task TryOpenDrawingAsync(MskLibraryRow row, bool forceRetry)
+    {
+        if (string.IsNullOrWhiteSpace(row.Ips))
+        {
+            return;
+        }
+
+        if (!forceRetry && !attemptedDrawingIps.Add(row.Ips))
+        {
+            return;
+        }
+
+        if (forceRetry)
+        {
+            attemptedDrawingIps.Add(row.Ips);
+        }
+
+        try
+        {
+            var query = FirstNotEmpty(row.Ips, row.Designation, row.Name);
+            var outputDirectory = GetDrawingCacheDirectory();
+            var drawing = await drawingService.FindDrawingPdfAsync(query, outputDirectory, CancellationToken.None);
+            if (drawing is null)
+            {
+                StatusText = $"PDF-чертеж IPS {row.Ips} в IPS Bridge не найден.";
+                return;
+            }
+
+            Process.Start(new ProcessStartInfo(drawing.FullName) { UseShellExecute = true });
+            StatusText = $"Открыт PDF-чертеж IPS {row.Ips}: {drawing.Name}";
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not open IPS drawing for {Ips}", row.Ips);
+            StatusText = $"PDF-чертеж IPS {row.Ips} не открыт: {ex.GetBaseException().Message}";
+        }
+    }
+
+    private static DirectoryInfo GetDrawingCacheDirectory()
+    {
+        var path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "BlankDemandPlanner",
+            "IpsDrawings");
+        return Directory.CreateDirectory(path);
+    }
+
+    private MskLibraryRow? ResolveRowFromSearch()
+    {
+        if (Rows.Count == 1)
+        {
+            return Rows[0];
+        }
+
+        var ips = UiText.Clean(Search).Trim();
+        return string.IsNullOrWhiteSpace(ips)
+            ? null
+            : Rows.FirstOrDefault(x => string.Equals(x.Ips, ips, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static MskCsvDetail? ResolveMskDetail(MskRecord? record, IReadOnlyDictionary<string, MskCsvDetail> details)
+    {
+        if (record is null)
+        {
+            return null;
+        }
+
+        return details.TryGetValue(record.FileName, out var byFile)
+            ? byFile
+            : details.TryGetValue($"IPS:{record.Ips}", out var byIps) ? byIps : null;
+    }
+
+    private static IReadOnlyDictionary<string, MskCsvDetail> LoadMskDetailsFromReport()
+    {
+        var path = FindWorkspaceFile(Path.Combine("reports", "msk_excel_analysis_20260723", "msk_library_extract.csv"));
+        if (path is null || !File.Exists(path))
+        {
+            return new Dictionary<string, MskCsvDetail>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var result = new Dictionary<string, MskCsvDetail>(StringComparer.OrdinalIgnoreCase);
+        foreach (var line in File.ReadLines(path, Encoding.UTF8).Skip(1))
+        {
+            var fields = SplitSemicolonCsv(line).ToArray();
+            if (fields.Length < 13)
+            {
+                continue;
+            }
+
+            var detail = new MskCsvDetail(
+                Source: fields[0],
+                Ips: fields[1],
+                BlankType: fields[4],
+                BlankName: fields[5],
+                Material: fields[7],
+                OneCCode: fields[12],
+                ConsumptionQuantity: fields[10],
+                UnitName: fields[11]);
+            if (!string.IsNullOrWhiteSpace(detail.Source))
+            {
+                result[detail.Source] = detail;
+            }
+
+            if (!string.IsNullOrWhiteSpace(detail.Ips))
+            {
+                result[$"IPS:{detail.Ips}"] = detail;
+            }
+        }
+
+        return result;
+    }
+
+    private static IEnumerable<string> SplitSemicolonCsv(string line)
+    {
+        var field = new StringBuilder();
+        var inQuotes = false;
+        for (var i = 0; i < line.Length; i++)
+        {
+            var ch = line[i];
+            if (ch == '"')
+            {
+                if (inQuotes && i + 1 < line.Length && line[i + 1] == '"')
+                {
+                    field.Append('"');
+                    i++;
+                }
+                else
+                {
+                    inQuotes = !inQuotes;
+                }
+            }
+            else if (ch == ';' && !inQuotes)
+            {
+                yield return field.ToString();
+                field.Clear();
+            }
+            else
+            {
+                field.Append(ch);
+            }
+        }
+
+        yield return field.ToString();
+    }
+
+    private static string? FindWorkspaceFile(string relativePath)
+    {
+        foreach (var basePath in new[] { AppContext.BaseDirectory, Environment.CurrentDirectory })
+        {
+            var directory = new DirectoryInfo(basePath);
+            for (var i = 0; directory is not null && i < 10; i++, directory = directory.Parent)
+            {
+                var path = Path.Combine(directory.FullName, relativePath);
+                if (File.Exists(path))
+                {
+                    return path;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static string FormatDecimal(decimal quantity) => quantity.ToString("0.####", CultureInfo.GetCultureInfo("ru-RU"));
+}
+
+public interface IIpsDrawingService
+{
+    Task<FileInfo?> FindDrawingPdfAsync(string query, DirectoryInfo outputDirectory, CancellationToken cancellationToken);
+}
+
+public sealed class IpsBridgeDrawingService : IIpsDrawingService
+{
+    private static readonly string[] RequiredTools =
+    [
+        "login",
+        "search_by_string",
+        "get_object",
+        "get_structure",
+        "export_file_attribute",
+        "read_staged_file_chunk"
+    ];
+
+    public async Task<FileInfo?> FindDrawingPdfAsync(string query, DirectoryInfo outputDirectory, CancellationToken cancellationToken)
+    {
+        var settings = IpsBridgeSettings.Load();
+        if (!settings.IsConfigured)
+        {
+            return null;
+        }
+
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(settings.TimeoutSeconds) };
+        var mcpSessionId = await InitializeAsync(http, settings, cancellationToken);
+        var tools = await ListToolsAsync(http, settings, mcpSessionId, cancellationToken);
+        if (RequiredTools.Any(tool => !tools.ContainsKey(tool)))
+        {
+            return null;
+        }
+
+        var ipsSessionId = await LoginAsync(http, settings, mcpSessionId, tools, cancellationToken);
+        try
+        {
+            var objects = await SearchObjectsAsync(http, settings, mcpSessionId, tools, ipsSessionId, query, cancellationToken);
+            foreach (var objectId in await GetCandidateObjectIdsAsync(http, settings, mcpSessionId, tools, ipsSessionId, objects, cancellationToken))
+            {
+                using var details = await CallToolAsync(http, settings, mcpSessionId, tools["get_object"], new Dictionary<string, object?>
+                {
+                    ["session_id"] = ipsSessionId,
+                    ["object_id"] = objectId
+                }, cancellationToken);
+                var payload = ExtractPayload(details);
+                if (payload.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                var pdfAttribute = FindPdfAttribute(payload);
+                if (pdfAttribute is null)
+                {
+                    continue;
+                }
+
+                var exportObjectId = ReadInt(payload, "objectId") ?? ReadInt(payload, "versionId") ?? objectId;
+                var (content, fileName) = await ExportFileAttributeAsync(
+                    http,
+                    settings,
+                    mcpSessionId,
+                    tools,
+                    ipsSessionId,
+                    exportObjectId,
+                    pdfAttribute.AttributeId,
+                    pdfAttribute.Index,
+                    cancellationToken);
+                if (content.Length > 4 && content[0] == '%' && content[1] == 'P' && content[2] == 'D' && content[3] == 'F')
+                {
+                    outputDirectory.Create();
+                    var safeName = MakeSafePdfFileName(string.IsNullOrWhiteSpace(fileName) ? $"{query}.pdf" : fileName);
+                    var path = Path.Combine(outputDirectory.FullName, safeName);
+                    await File.WriteAllBytesAsync(path, content, cancellationToken);
+                    return new FileInfo(path);
+                }
+            }
+
+            return null;
+        }
+        finally
+        {
+            if (tools.TryGetValue("logout", out var logout))
+            {
+                try
+                {
+                    await CallToolAsync(http, settings, mcpSessionId, logout, new Dictionary<string, object?>
+                    {
+                        ["session_id"] = ipsSessionId
+                    }, cancellationToken);
+                }
+                catch
+                {
+                    // Logout is best-effort: the bridge will expire the session.
+                }
+            }
+        }
+    }
+
+    private static async Task<string?> InitializeAsync(HttpClient http, IpsBridgeSettings settings, CancellationToken cancellationToken)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["jsonrpc"] = "2.0",
+            ["id"] = 1,
+            ["method"] = "initialize",
+            ["params"] = new Dictionary<string, object?>
+            {
+                ["protocolVersion"] = "2024-11-05",
+                ["capabilities"] = new Dictionary<string, object?>(),
+                ["clientInfo"] = new Dictionary<string, object?> { ["name"] = "blank-demand-planner", ["version"] = "1.0" }
+            }
+        };
+        using var response = await PostAsync(http, settings, payload, null, cancellationToken);
+        var sessionId = response.Headers.TryGetValues("mcp-session-id", out var values)
+            ? values.FirstOrDefault()
+            : response.Headers.TryGetValues("Mcp-Session-Id", out var altValues) ? altValues.FirstOrDefault() : null;
+        using var _ = await PostAsync(http, settings, new Dictionary<string, object?>
+        {
+            ["jsonrpc"] = "2.0",
+            ["method"] = "notifications/initialized",
+            ["params"] = new Dictionary<string, object?>()
+        }, sessionId, cancellationToken);
+        return sessionId;
+    }
+
+    private static async Task<Dictionary<string, JsonElement>> ListToolsAsync(HttpClient http, IpsBridgeSettings settings, string? sessionId, CancellationToken cancellationToken)
+    {
+        using var document = await RpcJsonAsync(http, settings, new Dictionary<string, object?>
+        {
+            ["jsonrpc"] = "2.0",
+            ["id"] = 2,
+            ["method"] = "tools/list",
+            ["params"] = new Dictionary<string, object?>()
+        }, sessionId, cancellationToken);
+        var result = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+        if (document.RootElement.TryGetProperty("result", out var resultElement) &&
+            resultElement.TryGetProperty("tools", out var toolsElement) &&
+            toolsElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var tool in toolsElement.EnumerateArray())
+            {
+                var name = ReadString(tool, "name");
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    result[name] = tool.Clone();
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static async Task<string> LoginAsync(HttpClient http, IpsBridgeSettings settings, string? sessionId, IReadOnlyDictionary<string, JsonElement> tools, CancellationToken cancellationToken)
+    {
+        var args = new Dictionary<string, object?>
+        {
+            ["username"] = settings.Username,
+            ["password"] = settings.Password
+        };
+        if (settings.RoleId is not null)
+        {
+            args["role_id"] = settings.RoleId.Value;
+        }
+        else if (!string.IsNullOrWhiteSpace(settings.RoleName))
+        {
+            args["role_name"] = settings.RoleName;
+        }
+
+        using var document = await CallToolAsync(http, settings, sessionId, tools["login"], args, cancellationToken);
+        var payload = ExtractPayload(document);
+        var session = FindString(payload, "session_id") ?? FindString(payload, "sessionId") ?? FindString(payload, "id");
+        return string.IsNullOrWhiteSpace(session)
+            ? throw new InvalidOperationException("IPS Bridge login не вернул session_id.")
+            : session;
+    }
+
+    private static async Task<List<JsonElement>> SearchObjectsAsync(HttpClient http, IpsBridgeSettings settings, string? mcpSessionId, IReadOnlyDictionary<string, JsonElement> tools, string ipsSessionId, string query, CancellationToken cancellationToken)
+    {
+        using var document = await CallToolAsync(http, settings, mcpSessionId, tools["search_by_string"], new Dictionary<string, object?>
+        {
+            ["session_id"] = ipsSessionId,
+            ["query"] = query,
+            ["result_limit"] = 5
+        }, cancellationToken);
+        var payload = ExtractPayload(document);
+        return payload.ValueKind == JsonValueKind.Object &&
+            payload.TryGetProperty("objects", out var objects) &&
+            objects.ValueKind == JsonValueKind.Array
+            ? objects.EnumerateArray().Select(x => x.Clone()).ToList()
+            : [];
+    }
+
+    private static async Task<List<int>> GetCandidateObjectIdsAsync(HttpClient http, IpsBridgeSettings settings, string? mcpSessionId, IReadOnlyDictionary<string, JsonElement> tools, string ipsSessionId, IReadOnlyList<JsonElement> objects, CancellationToken cancellationToken)
+    {
+        var ids = new List<int>();
+        foreach (var obj in objects)
+        {
+            AddUnique(ids, ReadInt(obj, "versionId"));
+            AddUnique(ids, ReadInt(obj, "masterId"));
+            var objectId = ReadInt(obj, "versionId") ?? ReadInt(obj, "masterId");
+            if (objectId is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                using var structure = await CallToolAsync(http, settings, mcpSessionId, tools["get_structure"], new Dictionary<string, object?>
+                {
+                    ["session_id"] = ipsSessionId,
+                    ["object_id"] = objectId.Value,
+                    ["rel_type_id"] = -1,
+                    ["direction"] = 0
+                }, cancellationToken);
+                var payload = ExtractPayload(structure);
+                if (payload.ValueKind == JsonValueKind.Object &&
+                    payload.TryGetProperty("items", out var items) &&
+                    items.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var item in items.EnumerateArray())
+                    {
+                        AddUnique(ids, ReadInt(item, "childObjectId"));
+                        AddUnique(ids, ReadInt(item, "childId"));
+                        AddUnique(ids, ReadInt(item, "-2"));
+                        AddUnique(ids, ReadInt(item, "-3"));
+                    }
+                }
+            }
+            catch
+            {
+                // Not every object has a readable structure; continue with direct candidates.
+            }
+        }
+
+        return ids;
+    }
+
+    private static PdfAttribute? FindPdfAttribute(JsonElement details)
+    {
+        if (!details.TryGetProperty("attributeDetails", out var attributes) || attributes.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        foreach (var attribute in attributes.EnumerateObject())
+        {
+            var detail = attribute.Value;
+            if (detail.ValueKind != JsonValueKind.Object ||
+                !string.Equals(ReadString(detail, "dataType"), "ftfile", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var attributeId = ReadInt(detail, "attributeId");
+            if (attributeId is null)
+            {
+                continue;
+            }
+
+            var names = new List<string>();
+            AddStrings(names, detail, "descriptions");
+            AddStrings(names, detail, "values");
+            var single = ReadString(detail, "description") ?? ReadString(detail, "value");
+            if (!string.IsNullOrWhiteSpace(single))
+            {
+                names.Add(single);
+            }
+
+            if (names.Count == 0)
+            {
+                names.Add(string.Empty);
+            }
+
+            for (var index = 0; index < names.Count; index++)
+            {
+                var name = names[index];
+                if (name.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains("pdf", StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains("черт", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new PdfAttribute(attributeId.Value, index);
+                }
+            }
+
+            if (attribute.Name.Contains("черт", StringComparison.OrdinalIgnoreCase))
+            {
+                return new PdfAttribute(attributeId.Value, 0);
+            }
+        }
+
+        return null;
+    }
+
+    private static async Task<(byte[] Content, string? FileName)> ExportFileAttributeAsync(HttpClient http, IpsBridgeSettings settings, string? mcpSessionId, IReadOnlyDictionary<string, JsonElement> tools, string ipsSessionId, int objectId, int attributeId, int index, CancellationToken cancellationToken)
+    {
+        using var exported = await CallToolAsync(http, settings, mcpSessionId, tools["export_file_attribute"], new Dictionary<string, object?>
+        {
+            ["session_id"] = ipsSessionId,
+            ["object_id"] = objectId,
+            ["attribute_id"] = attributeId,
+            ["index"] = index,
+            ["content_type"] = "application/pdf"
+        }, cancellationToken);
+        var payload = ExtractPayload(exported);
+        var fileInfo = payload;
+        if (payload.ValueKind == JsonValueKind.Object &&
+            payload.TryGetProperty("files", out var files) &&
+            files.ValueKind == JsonValueKind.Array &&
+            files.GetArrayLength() > 0)
+        {
+            fileInfo = files[0];
+        }
+
+        var fileId = ReadString(fileInfo, "fileId") ?? ReadString(fileInfo, "file_id");
+        var token = ReadString(fileInfo, "token");
+        var fileName = ReadString(fileInfo, "fileName") ?? ReadString(fileInfo, "filename");
+        if (string.IsNullOrWhiteSpace(fileId) || string.IsNullOrWhiteSpace(token))
+        {
+            throw new InvalidOperationException("IPS Bridge export_file_attribute не вернул fileId/token.");
+        }
+
+        var chunks = new List<byte>();
+        var offset = 0;
+        while (true)
+        {
+            using var chunkDocument = await CallToolAsync(http, settings, mcpSessionId, tools["read_staged_file_chunk"], new Dictionary<string, object?>
+            {
+                ["file_id"] = fileId,
+                ["token"] = token,
+                ["offset"] = offset,
+                ["size"] = 1_048_576
+            }, cancellationToken);
+            var chunk = ExtractPayload(chunkDocument);
+            var dataBase64 = ReadString(chunk, "dataBase64") ?? ReadString(chunk, "data") ?? ReadString(chunk, "content") ?? ReadString(chunk, "base64");
+            if (string.IsNullOrWhiteSpace(dataBase64))
+            {
+                throw new InvalidOperationException("IPS Bridge read_staged_file_chunk не вернул dataBase64.");
+            }
+
+            chunks.AddRange(Convert.FromBase64String(dataBase64));
+            if (ReadBool(chunk, "eof") == true)
+            {
+                break;
+            }
+
+            var nextOffset = ReadInt(chunk, "nextOffset");
+            if (nextOffset is null || nextOffset.Value <= offset)
+            {
+                break;
+            }
+
+            offset = nextOffset.Value;
+        }
+
+        return (chunks.ToArray(), fileName);
+    }
+
+    private static async Task<JsonDocument> CallToolAsync(HttpClient http, IpsBridgeSettings settings, string? sessionId, JsonElement tool, Dictionary<string, object?> arguments, CancellationToken cancellationToken)
+    {
+        var toolName = ReadString(tool, "name") ?? throw new InvalidOperationException("IPS Bridge вернул tool без имени.");
+        return await RpcJsonAsync(http, settings, new Dictionary<string, object?>
+        {
+            ["jsonrpc"] = "2.0",
+            ["id"] = 3,
+            ["method"] = "tools/call",
+            ["params"] = new Dictionary<string, object?>
+            {
+                ["name"] = toolName,
+                ["arguments"] = arguments
+            }
+        }, sessionId, cancellationToken);
+    }
+
+    private static async Task<JsonDocument> RpcJsonAsync(HttpClient http, IpsBridgeSettings settings, Dictionary<string, object?> payload, string? sessionId, CancellationToken cancellationToken)
+    {
+        using var response = await PostAsync(http, settings, payload, sessionId, cancellationToken);
+        var text = (await response.Content.ReadAsStringAsync(cancellationToken)).Trim();
+        if (text.StartsWith("event:", StringComparison.OrdinalIgnoreCase) || text.Contains("\ndata:", StringComparison.OrdinalIgnoreCase))
+        {
+            text = ExtractSseData(text);
+        }
+
+        var document = JsonDocument.Parse(text);
+        if (document.RootElement.TryGetProperty("error", out var error))
+        {
+            throw new InvalidOperationException($"IPS MCP error: {error}");
+        }
+
+        return document;
+    }
+
+    private static async Task<HttpResponseMessage> PostAsync(HttpClient http, IpsBridgeSettings settings, Dictionary<string, object?> payload, string? sessionId, CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, settings.Url)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+        };
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+        if (!string.IsNullOrWhiteSpace(settings.Username) || !string.IsNullOrWhiteSpace(settings.Password))
+        {
+            var token = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{settings.Username}:{settings.Password}"));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", token);
+        }
+
+        if (!string.IsNullOrWhiteSpace(sessionId))
+        {
+            request.Headers.TryAddWithoutValidation("Mcp-Session-Id", sessionId);
+        }
+
+        var response = await http.SendAsync(request, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        return response;
+    }
+
+    private static JsonElement ExtractPayload(JsonDocument document) => ExtractPayload(document.RootElement);
+
+    private static JsonElement ExtractPayload(JsonElement element)
+    {
+        var payload = element;
+        if (payload.ValueKind == JsonValueKind.Object && payload.TryGetProperty("result", out var result))
+        {
+            payload = result;
+        }
+
+        if (payload.ValueKind == JsonValueKind.Object && payload.TryGetProperty("structuredContent", out var structured))
+        {
+            return structured.Clone();
+        }
+
+        var text = ExtractFirstJsonText(payload);
+        if (!string.IsNullOrWhiteSpace(text))
+        {
+            using var parsed = JsonDocument.Parse(text);
+            return parsed.RootElement.Clone();
+        }
+
+        return payload.Clone();
+    }
+
+    private static string? ExtractFirstJsonText(JsonElement element)
+    {
+        foreach (var nested in Walk(element))
+        {
+            if (nested.ValueKind == JsonValueKind.Object &&
+                string.Equals(ReadString(nested, "type"), "text", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = ReadString(nested, "text");
+                if (!string.IsNullOrWhiteSpace(value) && value.TrimStart().StartsWith('{'))
+                {
+                    return value;
+                }
+            }
+            else if (nested.ValueKind == JsonValueKind.String)
+            {
+                var value = nested.GetString();
+                if (!string.IsNullOrWhiteSpace(value) && value.TrimStart().StartsWith('{'))
+                {
+                    return value;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<JsonElement> Walk(JsonElement element)
+    {
+        yield return element;
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in element.EnumerateObject())
+            {
+                foreach (var nested in Walk(property.Value))
+                {
+                    yield return nested;
+                }
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                foreach (var nested in Walk(item))
+                {
+                    yield return nested;
+                }
+            }
+        }
+    }
+
+    private static string? FindString(JsonElement element, string name)
+    {
+        foreach (var nested in Walk(element))
+        {
+            var value = ReadString(nested, name);
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ReadString(JsonElement element, string name)
+    {
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(name, out var value))
+        {
+            return null;
+        }
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString(),
+            JsonValueKind.Number => value.ToString(),
+            _ => null
+        };
+    }
+
+    private static int? ReadInt(JsonElement element, string name)
+    {
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(name, out var value))
+        {
+            return null;
+        }
+
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number))
+        {
+            return number;
+        }
+
+        return value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), out number) ? number : null;
+    }
+
+    private static bool? ReadBool(JsonElement element, string name)
+    {
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(name, out var value))
+        {
+            return null;
+        }
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String when bool.TryParse(value.GetString(), out var parsed) => parsed,
+            _ => null
+        };
+    }
+
+    private static void AddStrings(List<string> values, JsonElement element, string name)
+    {
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty(name, out var nested) ||
+            nested.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        values.AddRange(nested.EnumerateArray().Select(x => x.ToString()));
+    }
+
+    private static void AddUnique(List<int> values, int? value)
+    {
+        if (value is > 0 && !values.Contains(value.Value))
+        {
+            values.Add(value.Value);
+        }
+    }
+
+    private static string ExtractSseData(string text) => string.Join(
+        "\n",
+        text.Split('\n')
+            .Select(x => x.TrimEnd('\r'))
+            .Where(x => x.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            .Select(x => x["data:".Length..].Trim()));
+
+    private static string MakeSafePdfFileName(string value)
+    {
+        var name = Regex.Replace(value, @"[^A-Za-zА-Яа-я0-9_. -]+", "_").Trim(' ', '_', '.');
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            name = "drawing";
+        }
+
+        if (name.Length > 120)
+        {
+            name = name[..120].Trim(' ', '_', '.');
+        }
+
+        return name.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase) ? name : $"{name}.pdf";
+    }
+
+    private sealed record PdfAttribute(int AttributeId, int Index);
+}
+
+public sealed record IpsBridgeSettings(
+    string Url,
+    string Username,
+    string Password,
+    int? RoleId,
+    string? RoleName,
+    double TimeoutSeconds)
+{
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(Url);
+
+    public static IpsBridgeSettings Load()
+    {
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in CandidateConfigFiles().Where(File.Exists))
+        {
+            foreach (var pair in ReadKeyValues(path))
+            {
+                values[pair.Key] = pair.Value;
+            }
+        }
+
+        foreach (var name in new[] { "IPS_MCP_URL", "IPS_MCP_USERNAME", "IPS_MCP_PASSWORD", "IPS_MCP_ROLE_ID", "IPS_MCP_ROLE_NAME", "IPS_MCP_TIMEOUT_SECONDS" })
+        {
+            var value = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                values[name] = value;
+            }
+        }
+
+        int? roleId = null;
+        if (int.TryParse(Get(values, "IPS_MCP_ROLE_ID", "ips_mcp_role_id", "role_id"), out var parsedRoleId))
+        {
+            roleId = parsedRoleId;
+        }
+
+        var timeout = double.TryParse(Get(values, "IPS_MCP_TIMEOUT_SECONDS", "ips_mcp_timeout_seconds", "timeout_seconds"), NumberStyles.Number, CultureInfo.InvariantCulture, out var parsedTimeout)
+            ? parsedTimeout
+            : 30d;
+        return new IpsBridgeSettings(
+            Get(values, "IPS_MCP_URL", "ips_mcp_url", "url"),
+            Get(values, "IPS_MCP_USERNAME", "ips_mcp_username", "username"),
+            Get(values, "IPS_MCP_PASSWORD", "ips_mcp_password", "password"),
+            roleId,
+            Get(values, "IPS_MCP_ROLE_NAME", "ips_mcp_role_name", "role_name"),
+            Math.Clamp(timeout, 5d, 120d));
+    }
+
+    private static IEnumerable<string> CandidateConfigFiles()
+    {
+        yield return Path.Combine(AppContext.BaseDirectory, "config.toml");
+        yield return Path.Combine(AppContext.BaseDirectory, "ips_bridge_config.toml");
+        yield return Path.Combine(AppContext.BaseDirectory, "Данные для работы", "config.toml");
+        yield return Path.Combine(AppContext.BaseDirectory, "Данные для работы", "ips_bridge_config.toml");
+        yield return Path.Combine(Environment.CurrentDirectory, "config.toml");
+        yield return Path.Combine(Environment.CurrentDirectory, "Данные для работы", "config.toml");
+        yield return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Интеграция с сервисами", "factory_ai_assistant", "config.toml");
+        yield return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Интеграция с сервисами", "factory_ai_assistant", ".env");
+    }
+
+    private static IEnumerable<KeyValuePair<string, string>> ReadKeyValues(string path)
+    {
+        foreach (var line in File.ReadLines(path, Encoding.UTF8))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0 || trimmed.StartsWith('#') || trimmed.StartsWith('['))
+            {
+                continue;
+            }
+
+            var index = trimmed.IndexOf('=');
+            if (index <= 0)
+            {
+                continue;
+            }
+
+            var key = trimmed[..index].Trim();
+            var value = trimmed[(index + 1)..].Trim().Trim('"', '\'');
+            if (!string.IsNullOrWhiteSpace(key))
+            {
+                yield return new KeyValuePair<string, string>(key, value);
+            }
+        }
+    }
+
+    private static string Get(IReadOnlyDictionary<string, string> values, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (values.TryGetValue(name, out var value))
+            {
+                return value;
+            }
+        }
+
+        return string.Empty;
+    }
+}
+
 public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext dbContext) : ObservableObject
 {
+    private bool suppressPartSearchChanged;
+
     public ObservableCollection<BlankSelectionRow> Rows { get; } = [];
     public ObservableCollection<PartWithoutBlankOption> PartSuggestions { get; } = [];
     public IReadOnlyList<DisplayOption<MeasurementUnit>> UnitTypes { get; } = UiText.ConsumptionUnitTypes;
@@ -2620,6 +3894,7 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
 
     [ObservableProperty] private DisplayOption<BlankType?> selectedBlankType = new(null, "Все подходящие");
     [ObservableProperty] private string partSearch = string.Empty;
+    [ObservableProperty] private bool isPartSuggestionsOpen;
     [ObservableProperty] private PartWithoutBlankOption? selectedPart;
     [ObservableProperty] private BlankSelectionRow? selectedBlankRow;
     [ObservableProperty] private string consumptionQuantityText = "1";
@@ -2633,7 +3908,17 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
     [ObservableProperty] private string lengthText = string.Empty;
     [ObservableProperty] private string statusText = "Введите размеры детали и нажмите \"Подобрать\".";
 
-    partial void OnPartSearchChanged(string value) => _ = LoadPartSuggestionsAsync();
+    partial void OnPartSearchChanged(string value)
+    {
+        if (suppressPartSearchChanged)
+        {
+            return;
+        }
+
+        SelectedPart = null;
+        _ = LoadPartSuggestionsAsync(openDropDown: !string.IsNullOrWhiteSpace(value));
+    }
+
     partial void OnSelectedPartChanged(PartWithoutBlankOption? value)
     {
         if (value is null)
@@ -2641,7 +3926,10 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
             return;
         }
 
+        suppressPartSearchChanged = true;
         PartSearch = value.DisplayName;
+        suppressPartSearchChanged = false;
+        IsPartSuggestionsOpen = false;
         StatusText = $"Выбрана деталь без заготовки: {value.Ips}. Подберите заготовку и нажмите \"Добавить в библиотеку\".";
     }
 
@@ -2653,10 +3941,12 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
         }
     }
 
-    public async Task LoadAsync() => await LoadPartSuggestionsAsync();
+    public async Task LoadAsync() => await LoadPartSuggestionsAsync(openDropDown: false);
 
     [RelayCommand]
-    public async Task LoadPartSuggestionsAsync()
+    public async Task LoadPartSuggestionsAsync() => await LoadPartSuggestionsAsync(openDropDown: false);
+
+    private async Task LoadPartSuggestionsAsync(bool openDropDown)
     {
         var search = (PartSearch ?? string.Empty).Trim();
         var query = dbContext.Parts.AsNoTracking()
@@ -2683,6 +3973,8 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
         {
             PartSuggestions.Add(part);
         }
+
+        IsPartSuggestionsOpen = openDropDown && PartSuggestions.Count > 0;
     }
 
     [RelayCommand]
@@ -2713,17 +4005,18 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
             query = query.Where(x => x.BlankType == type);
         }
 
-        if (!string.IsNullOrWhiteSpace(Material))
-        {
-            var materialKey = NormalizeMaterial(Material);
-            query = query.Where(x => x.Material != null && x.Material.ToUpper().Replace(" ", "").Contains(materialKey));
-        }
-
         var blanks = await query
             .OrderBy(x => x.BlankType)
             .ThenBy(x => x.CanonicalName)
-            .Take(5000)
+            .Take(20000)
             .ToListAsync();
+        if (!string.IsNullOrWhiteSpace(Material))
+        {
+            var materialKey = NormalizeMaterial(Material);
+            blanks = blanks
+                .Where(x => MaterialMatches(x, materialKey))
+                .ToList();
+        }
 
         var latestSnapshotId = await dbContext.StockSnapshots.AsNoTracking()
             .OrderByDescending(x => x.SnapshotDate)
@@ -2805,6 +4098,7 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
 
         StatusText = $"Добавлено в библиотеку: {part.Ips} -> {SelectedBlankRow.OneCCode} ({FormatDecimal(quantity)} {SelectedUnit.DisplayName}).";
         SelectedPart = null;
+        IsPartSuggestionsOpen = false;
         PartSearch = string.Empty;
         await LoadPartSuggestionsAsync();
     }
@@ -2950,6 +4244,19 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
     }
 
     private static string NormalizeMaterial(string value) => value.ToUpperInvariant().Replace(" ", string.Empty, StringComparison.Ordinal);
+    private static bool MaterialMatches(CanonicalBlank blank, string materialKey)
+    {
+        if (string.IsNullOrWhiteSpace(materialKey))
+        {
+            return true;
+        }
+
+        return NormalizeMaterial(blank.Material ?? string.Empty).Contains(materialKey, StringComparison.OrdinalIgnoreCase) ||
+            NormalizeMaterial(blank.CanonicalName).Contains(materialKey, StringComparison.OrdinalIgnoreCase) ||
+            blank.Aliases.Any(a =>
+                NormalizeMaterial(a.SourceName).Contains(materialKey, StringComparison.OrdinalIgnoreCase) ||
+                NormalizeMaterial(a.NormalizedSourceName).Contains(materialKey, StringComparison.OrdinalIgnoreCase));
+    }
     private static string FormatDecimal(decimal quantity) => quantity.ToString("0.####", CultureInfo.GetCultureInfo("ru-RU"));
     private static string FormatSize(CanonicalBlank blank)
     {
@@ -2972,6 +4279,7 @@ public sealed partial class CalculationViewModel(
     public ObservableCollection<CalculationMaterialRow> Rows { get; } = [];
     public ObservableCollection<LibraryBlankOption> BlankSuggestions { get; } = [];
     public IReadOnlyList<DisplayOption<MeasurementUnit>> UnitTypes { get; } = UiText.ConsumptionUnitTypes;
+    private const string OneTimeBlankComment = "Разовая заготовка из расчета";
     [ObservableProperty] private string statusText = string.Empty;
     [ObservableProperty] private CalculationMaterialRow? selectedRow;
     [ObservableProperty] private string blankSearch = string.Empty;
@@ -3058,6 +4366,7 @@ public sealed partial class CalculationViewModel(
     {
         var run = await dbContext.CalculationRuns.AsNoTracking()
             .Include(x => x.Items)
+            .ThenInclude(x => x.Sources)
             .OrderByDescending(x => x.StartedAt)
             .FirstOrDefaultAsync();
         Rows.Clear();
@@ -3094,55 +4403,61 @@ public sealed partial class CalculationViewModel(
             return;
         }
 
-        var previousMaps = await dbContext.PartBlankMaps.AsNoTracking()
-            .Where(x => x.Part != null && x.Part.Ips == SelectedRow.Ips)
-            .Select(x => new LibraryMapSnapshot(x.Id, x.IsActive, x.IsPrimary, x.UpdatedAt))
-            .ToListAsync();
-        var part = await dbContext.Parts
-            .Include(x => x.BlankMaps.Where(m => m.IsActive))
-            .FirstOrDefaultAsync(x => x.Ips == SelectedRow.Ips);
-        if (part is null)
+        if (_lastRunId is null)
         {
-            part = new Part
-            {
-                Ips = SelectedRow.Ips,
-                Name = SelectedRow.Name,
-                Source = "Ручная привязка из расчета"
-            };
-            dbContext.Parts.Add(part);
-        }
-        else
-        {
-            part.Name = string.IsNullOrWhiteSpace(part.Name) ? SelectedRow.Name : part.Name;
-            part.UpdatedAt = DateTime.UtcNow;
+            AssignmentStatus = "Нет текущего расчета для разового назначения.";
+            return;
         }
 
-        foreach (var map in part.BlankMaps.Where(x => x.IsActive && x.IsPrimary))
+        if (!TryParseQuantity(SelectedRow.MaterialQuantity, out var demandQuantity) || demandQuantity <= 0)
         {
-            map.IsPrimary = false;
-            map.UpdatedAt = DateTime.UtcNow;
+            AssignmentStatus = "В выбранной строке нет количества для разовой заготовки.";
+            return;
         }
 
-        dbContext.PartBlankMaps.Add(new PartBlankMap
+        var blank = await dbContext.CanonicalBlanks
+            .Include(x => x.Aliases)
+            .FirstAsync(x => x.Id == SelectedBlank.Id);
+        var alias = blank.Aliases.FirstOrDefault(x => x.IsActive);
+        var required = demandQuantity * quantity;
+        var calculationItem = new CalculationItem
         {
-            Part = part,
-            CanonicalBlankId = SelectedBlank.Id,
-            ConsumptionQuantity = quantity,
-            ConsumptionUnit = SelectedUnit.Value,
-            Source = "Ручное назначение из расчета",
-            IsPrimary = true,
-            IsActive = true
+            CalculationRunId = _lastRunId.Value,
+            CanonicalBlankId = blank.Id,
+            CanonicalName = UiText.Clean(alias?.SourceName ?? blank.CanonicalName),
+            PrimaryOneCCode = alias?.OneCCode,
+            OneCCodes = alias?.OneCCode ?? string.Empty,
+            Unit = SelectedUnit.Value,
+            TotalRequired = required,
+            TotalStock = 0,
+            PurchaseQuantity = required,
+            Status = CalculationStatus.Ok,
+            Comment = $"{OneTimeBlankComment}; DemandItemId={SelectedRow.DemandItemId}"
+        };
+        calculationItem.Sources.Add(new CalculationItemSource
+        {
+            Ips = SelectedRow.Ips,
+            PartName = SelectedRow.Name,
+            DemandQuantity = demandQuantity,
+            RequiredQuantity = required,
+            Unit = SelectedUnit.Value
         });
+        dbContext.CalculationItems.Add(calculationItem);
 
         await dbContext.SaveChangesAsync();
-        UndoCenter.Push("Отмена назначения заготовки", async () => await RestoreMapsAsync(previousMaps));
-        AssignmentStatus = $"Связь сохранена: IPS {SelectedRow.Ips} -> {SelectedBlank.DisplayName}.";
-        if (_lastBatchId is not null)
+        UndoCenter.Push("Отмена разовой заготовки", async () =>
         {
-            var run = await calculationService.CalculateAsync(new CalculationOptions(_lastBatchId.Value), CancellationToken.None);
-            _lastRunId = run.Id;
+            var saved = await dbContext.CalculationItems.FirstOrDefaultAsync(x => x.Id == calculationItem.Id);
+            if (saved is not null)
+            {
+                dbContext.CalculationItems.Remove(saved);
+                await dbContext.SaveChangesAsync();
+            }
+
             await LoadLastRunAsync();
-        }
+        });
+        AssignmentStatus = $"Разовая заготовка добавлена в текущий расчет: IPS {SelectedRow.Ips} -> {SelectedBlank.DisplayName}.";
+        await LoadLastRunAsync();
     }
 
     [RelayCommand]
@@ -3153,17 +4468,26 @@ public sealed partial class CalculationViewModel(
             .Where(x => x.IsActive);
 
         var searchText = BlankSearch.Trim();
-        if (!string.IsNullOrWhiteSpace(searchText))
-        {
-            query = query.Where(x =>
-                x.CanonicalName.Contains(searchText) ||
-                (x.Material != null && x.Material.Contains(searchText)) ||
-                x.Aliases.Any(a => a.OneCCode.Contains(searchText) || a.SourceName.Contains(searchText)));
-        }
-
         var options = await query
             .OrderBy(x => x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault() ?? x.CanonicalName)
-            .Take(50)
+            .Take(5000)
+            .ToListAsync();
+        if (!string.IsNullOrWhiteSpace(searchText))
+        {
+            options = options
+                .Where(x =>
+                    ContainsSearch(x.CanonicalName, searchText) ||
+                    ContainsSearch(x.Material, searchText) ||
+                    x.Aliases.Any(a => ContainsSearch(a.OneCCode, searchText) || ContainsSearch(a.SourceName, searchText)))
+                .Take(50)
+                .ToList();
+        }
+        else
+        {
+            options = options.Take(50).ToList();
+        }
+
+        var blankOptions = options
             .Select(x => new LibraryBlankOption(
                 x.Id,
                 x.BlankType,
@@ -3172,10 +4496,10 @@ public sealed partial class CalculationViewModel(
                 x.Material,
                 x.BaseUnit,
                 x.Aliases.Where(a => a.IsActive).Select(a => a.OneCCode).FirstOrDefault()))
-            .ToListAsync();
+            .ToList();
 
         BlankSuggestions.Clear();
-        foreach (var option in options)
+        foreach (var option in blankOptions)
         {
             BlankSuggestions.Add(option);
         }
@@ -3210,6 +4534,11 @@ public sealed partial class CalculationViewModel(
             .Where(x => ipsValues.Contains(x.Ips))
             .ToDictionaryAsync(x => x.Ips, StringComparer.OrdinalIgnoreCase);
         var workInProgressByIps = await LoadWorkInProgressByIpsAsync(ipsValues);
+        var oneTimeAssignments = run.Items
+            .Where(x => x.Comment?.StartsWith(OneTimeBlankComment, StringComparison.OrdinalIgnoreCase) == true)
+            .Select(x => (Item: x, DemandItemId: TryGetOneTimeDemandItemId(x.Comment)))
+            .Where(x => x.DemandItemId is not null)
+            .ToDictionary(x => x.DemandItemId!.Value, x => x.Item);
 
         Rows.Clear();
         var number = 1;
@@ -3218,6 +4547,28 @@ public sealed partial class CalculationViewModel(
             var inProduction = ApplyWorkInProgress(demand.Ips, demand.Quantity, workInProgressByIps, out var effectiveDemandQuantity);
             if (effectiveDemandQuantity <= 0)
             {
+                continue;
+            }
+
+            if (oneTimeAssignments.TryGetValue(demand.Id, out var oneTimeItem))
+            {
+                var source = oneTimeItem.Sources.FirstOrDefault();
+                Rows.Add(new CalculationMaterialRow(
+                    number++,
+                    UiText.Clean(demand.Project),
+                    UiText.Clean(FirstNotEmpty(demand.ProductionSystem, demand.SerialNumber)),
+                    demand.Ips,
+                    UiText.Clean(FirstNotEmpty(demand.SourcePartName, source?.PartName, demand.Ips)),
+                    FormatDecimal(demand.Quantity),
+                    FormatDecimal(inProduction),
+                    oneTimeItem.PrimaryOneCCode ?? string.Empty,
+                    string.Empty,
+                    UiText.Clean(oneTimeItem.CanonicalName),
+                    UiText.DisplayUnit(oneTimeItem.Unit),
+                    FormatDecimal(oneTimeItem.PurchaseQuantity),
+                    FormatBlankDemandDate(demand.DemandDate, 30),
+                    false,
+                    demand.Id));
                 continue;
             }
 
@@ -3244,7 +4595,8 @@ public sealed partial class CalculationViewModel(
                     UiText.Clean(demand.Unit),
                     FormatDecimal(effectiveDemandQuantity),
                     FormatBlankDemandDate(demand.DemandDate, 30),
-                    true));
+                    true,
+                    demand.Id));
                 continue;
             }
 
@@ -3273,7 +4625,8 @@ public sealed partial class CalculationViewModel(
                     UiText.DisplayUnit(map.ConsumptionUnit),
                     FormatDecimal(materialQuantity),
                     FormatBlankDemandDate(demand.DemandDate, map.BlankLeadTimeDays),
-                    false));
+                    false,
+                    demand.Id));
             }
         }
     }
@@ -3308,20 +4661,20 @@ public sealed partial class CalculationViewModel(
             return new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
         }
 
-        var ipsKeys = ipsValues.Select(NormalizeCodeKey).Where(x => x.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var ipsKeys = ipsValues.Select(StockCodeNormalizer.NormalizeForComparison).Where(x => x.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var stockItems = await dbContext.StockItems.AsNoTracking()
             .Where(x => x.StockSnapshotId == latestSnapshotId.Value && x.Unit == MeasurementUnit.Piece)
             .ToListAsync();
 
         return stockItems
-            .Where(x => ipsKeys.Contains(NormalizeCodeKey(x.OneCCode)))
-            .GroupBy(x => NormalizeCodeKey(x.OneCCode), StringComparer.OrdinalIgnoreCase)
+            .Where(x => StockWarehouseRules.IsCmoWipWarehouse(x.Warehouse) && ipsKeys.Contains(StockCodeNormalizer.NormalizeForComparison(x.OneCCode)))
+            .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.Sum(i => i.Quantity), StringComparer.OrdinalIgnoreCase);
     }
 
     private static decimal ApplyWorkInProgress(string ips, decimal demandQuantity, IDictionary<string, decimal> workInProgressByIps, out decimal effectiveDemandQuantity)
     {
-        var key = NormalizeCodeKey(ips);
+        var key = StockCodeNormalizer.NormalizeForComparison(ips);
         if (!workInProgressByIps.TryGetValue(key, out var inProduction) || inProduction <= 0)
         {
             effectiveDemandQuantity = demandQuantity;
@@ -3336,18 +4689,6 @@ public sealed partial class CalculationViewModel(
 
     private static string FormatBlankDemandDate(DateTime? demandDate, int leadTimeDays) =>
         demandDate?.AddDays(-Math.Max(0, leadTimeDays)).ToLocalTime().ToString("dd.MM.yyyy") ?? string.Empty;
-
-    private static string NormalizeCodeKey(string? value)
-    {
-        var text = UiText.Clean(value).Trim();
-        if (text.Length == 0)
-        {
-            return string.Empty;
-        }
-
-        var withoutLeadingZeros = text.TrimStart('0');
-        return withoutLeadingZeros.Length == 0 ? "0" : withoutLeadingZeros;
-    }
 
     private async Task RestoreMapsAsync(List<LibraryMapSnapshot> snapshot)
     {
@@ -3371,6 +4712,20 @@ public sealed partial class CalculationViewModel(
     }
 
     private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) ?? string.Empty;
+    private static bool ContainsSearch(string? value, string searchText) =>
+        !string.IsNullOrWhiteSpace(value) && value.Contains(searchText, StringComparison.OrdinalIgnoreCase);
+    private static long? TryGetOneTimeDemandItemId(string? comment)
+    {
+        const string marker = "DemandItemId=";
+        var index = comment?.IndexOf(marker, StringComparison.OrdinalIgnoreCase) ?? -1;
+        if (index < 0 || comment is null)
+        {
+            return null;
+        }
+
+        var value = comment[(index + marker.Length)..].Trim();
+        return long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var id) ? id : null;
+    }
     private static string FormatDecimal(decimal quantity) => quantity.ToString("0.####", CultureInfo.GetCultureInfo("ru-RU"));
     private static bool TryParseQuantity(string? value, out decimal quantity)
     {
@@ -3760,7 +5115,9 @@ public static class UndoCenter
 
 public sealed record DemandSnapshot(long Id, string? Project, string? SerialNumber, string? ProductionSystem, string Ips, string? SourcePartName, string? Unit, decimal Quantity, DateTime? DemandDate);
 
+public sealed record LibraryDeleteSnapshot(List<LibraryMapSnapshot> Maps, List<LibraryPartSnapshot> Parts);
 public sealed record LibraryMapSnapshot(long Id, bool IsActive, bool IsPrimary, DateTime UpdatedAt);
+public sealed record LibraryPartSnapshot(long Id, string? Source, DateTime UpdatedAt);
 
 public sealed record LibraryRow(long PartId, long? PartBlankMapId, long? CanonicalBlankId, string Ips, string? Designation, string PartName, string? BlankType, string? BlankName, string? Material, string? OneCCode, decimal? ConsumptionQuantity, MeasurementUnit? ConsumptionUnit, string Quantity, string UnitName, int BlankLeadTimeDays, string BlankLeadTimeDaysText, string? Source, string UpdatedAt);
 
@@ -3785,9 +5142,9 @@ public sealed partial class DemandRow(long id, string project, string machineNum
     [ObservableProperty] private string demandDate = demandDate;
 }
 
-public sealed record DemandDetailRow(string DemandDate, string Quantity, string WorkInProgressBefore, string InProductionQuantity, string WorkInProgressAfter, string Project, string MachineNumber);
+public sealed record DemandDetailRow(string DemandDate, string Quantity, string InProductionQuantity, string WorkInProgressAfter, string Project, string MachineNumber);
 
-public sealed record CalculationMaterialRow(int Number, string ProductionSystem, string MachineNumber, string Ips, string Name, string PartQuantity, string InProductionQuantity, string OneCCode, string BlankType, string Nomenclature, string UnitName, string MaterialQuantity, string DemandDate, bool IsMissingBlank);
+public sealed record CalculationMaterialRow(int Number, string ProductionSystem, string MachineNumber, string Ips, string Name, string PartQuantity, string InProductionQuantity, string OneCCode, string BlankType, string Nomenclature, string UnitName, string MaterialQuantity, string DemandDate, bool IsMissingBlank, long DemandItemId);
 
 public sealed record PartWithoutBlankOption(long PartId, string Ips, string? Designation, string PartName)
 {
@@ -3813,6 +5170,25 @@ public sealed record NsiBlankRow(long AliasId, long CanonicalBlankId, string One
 public sealed record NsiUsageRow(string Ips, string Designation, string PartName, string Quantity, string UnitName, string Source);
 
 public sealed record StockRow(string OneCCode, string SourceName, string Quantity, string UnitName, string Warehouse);
+
+public sealed record MskLibraryRow(
+    string Ips,
+    string Designation,
+    string Name,
+    string HasMsk,
+    string HasLibraryPart,
+    string FilePath,
+    string FileName,
+    string ImportedAt,
+    string BlankType,
+    string BlankName,
+    string Material,
+    string OneCCode,
+    string ConsumptionQuantity,
+    string UnitName,
+    string BlankLeadTimeDays);
+
+public sealed record MskCsvDetail(string Source, string Ips, string BlankType, string BlankName, string Material, string OneCCode, string ConsumptionQuantity, string UnitName);
 
 public sealed record DisplayOption<T>(T Value, string DisplayName);
 

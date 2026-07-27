@@ -148,6 +148,55 @@ public sealed class DomainServiceTests
     }
 
     [Fact]
+    public async Task Calculation_matches_ips_with_eleven_digit_1c_code()
+    {
+        await using var db = CreateDb();
+        var blank = new CanonicalBlank { CanonicalName = "Круг D80", CanonicalKey = "ROUND|D80|IPS11", BaseUnit = MeasurementUnit.Piece };
+        var alias = new BlankAlias { CanonicalBlank = blank, OneCCode = "УТ080", SourceName = "Круг D80", NormalizedSourceName = "Круг D80", Source = "test" };
+        var part = AddPart(db, "1802132", "Заготовка оправки", blank);
+        var batch = new DemandBatch { Name = "Потребность" };
+        db.DemandItems.Add(new DemandItem { DemandBatch = batch, Part = part, Ips = part.Ips, Quantity = 10 });
+        var snapshot = new StockSnapshot();
+        db.StockItems.AddRange(
+            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 1, Unit = MeasurementUnit.Piece, Warehouse = "1 секция (ПЗМЦ)" },
+            new StockItem { StockSnapshot = snapshot, OneCCode = "00001802132", SourceName = part.Name, Quantity = 4, Unit = MeasurementUnit.Piece, Warehouse = "44 секция НЗП (незавершенное производство)" });
+        await db.SaveChangesAsync();
+
+        var run = await CreateCalculation(db).CalculateAsync(new CalculationOptions(batch.Id, snapshot.Id), CancellationToken.None);
+
+        run.Items.Should().ContainSingle();
+        run.Items.Single().TotalRequired.Should().Be(6);
+        run.Items.Single().TotalStock.Should().Be(1);
+        run.Items.Single().PurchaseQuantity.Should().Be(5);
+    }
+
+    [Fact]
+    public async Task Calculation_uses_configured_warehouses_for_material_stock_and_work_in_progress()
+    {
+        await using var db = CreateDb();
+        var blank = new CanonicalBlank { CanonicalName = "Круг D70", CanonicalKey = "ROUND|D70|SECTIONS", BaseUnit = MeasurementUnit.Piece };
+        var alias = new BlankAlias { CanonicalBlank = blank, OneCCode = "УТ070", SourceName = "Круг D70", NormalizedSourceName = "Круг D70", Source = "test" };
+        var part = AddPart(db, "170070", "Секционная деталь", blank);
+        var batch = new DemandBatch { Name = "Потребность" };
+        db.DemandItems.Add(new DemandItem { DemandBatch = batch, Part = part, Ips = part.Ips, Quantity = 10 });
+        var snapshot = new StockSnapshot();
+        db.StockItems.AddRange(
+            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 3, Unit = MeasurementUnit.Piece, Warehouse = "1 секция (ПЗМЦ)" },
+            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 2, Unit = MeasurementUnit.Piece, Warehouse = "Покраска ТМЦ" },
+            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 1, Unit = MeasurementUnit.Piece, Warehouse = "ТМЦ для временного хранения ЦМО" },
+            new StockItem { StockSnapshot = snapshot, BlankAlias = alias, OneCCode = alias.OneCCode, SourceName = alias.SourceName, Quantity = 100, Unit = MeasurementUnit.Piece, Warehouse = "44 секция НЗП (незавершенное производство)" },
+            new StockItem { StockSnapshot = snapshot, OneCCode = "00000170070", SourceName = part.Name, Quantity = 4, Unit = MeasurementUnit.Piece, Warehouse = "44 секция НЗП (незавершенное производство)" },
+            new StockItem { StockSnapshot = snapshot, OneCCode = "00000170070", SourceName = part.Name, Quantity = 2, Unit = MeasurementUnit.Piece, Warehouse = "Детали МУ в обработке на стороне" });
+        await db.SaveChangesAsync();
+
+        var run = await CreateCalculation(db).CalculateAsync(new CalculationOptions(batch.Id, snapshot.Id), CancellationToken.None);
+
+        run.Items.Single().TotalRequired.Should().Be(4);
+        run.Items.Single().TotalStock.Should().Be(6);
+        run.Items.Single().PurchaseQuantity.Should().Be(0);
+    }
+
+    [Fact]
     public async Task Calculation_sums_fractional_meter_consumption_and_subtracts_fractional_stock()
     {
         await using var db = CreateDb();

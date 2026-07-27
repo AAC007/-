@@ -62,6 +62,256 @@ public sealed class RealFileImportTests
     }
 
     [Fact]
+    public async Task Msk_headerless_library_file_updates_part_blank_library()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"bdp_msk_headerless_{Guid.NewGuid():N}.db");
+        var filePath = Path.Combine(Path.GetTempPath(), $"Данные из МСК_{Guid.NewGuid():N}.xlsx");
+        try
+        {
+            using (var package = new ExcelPackage())
+            {
+                var sheet = package.Workbook.Worksheets.Add("Лист1");
+                sheet.Cells[1, 1].Value = "1354749";
+                sheet.Cells[1, 2].Value = "07.053.00.002";
+                sheet.Cells[1, 3].Value = "Диск тормозной";
+                sheet.Cells[1, 4].Value = "Круг";
+                sheet.Cells[1, 5].Value = "D330";
+                sheet.Cells[1, 6].Value = "Сталь 40Х";
+                sheet.Cells[1, 7].Value = "ГОСТ 4543-2016";
+                sheet.Cells[1, 8].Value = "ГОСТ 2590-2006";
+                sheet.Cells[1, 9].Value = 0.025m;
+                sheet.Cells[1, 10].Value = "пог. м";
+                sheet.Cells[1, 11].Value = "УТ000007475";
+                sheet.Cells[1, 12].Value = "Круг D330 Сталь 40Х ГОСТ 2590-2006 / ГОСТ 4543-2016";
+                await package.SaveAsAsync(new FileInfo(filePath));
+            }
+
+            var options = new DbContextOptionsBuilder<BlankDemandPlannerDbContext>()
+                .UseSqlite($"Data Source={dbPath};Pooling=False")
+                .Options;
+            await using var db = new BlankDemandPlannerDbContext(options);
+            await db.Database.MigrateAsync();
+
+            var importer = new ExcelImportService(db, new BlankNormalizationService(), new I012ValidationService(db), NullLogger<ExcelImportService>.Instance);
+            var report = await importer.ImportManufacturingBlankLibraryAsync(filePath, null, CancellationToken.None);
+
+            report.ReadRows.Should().Be(1);
+            report.SkippedRows.Should().Be(0);
+            var part = await db.Parts.Include(x => x.BlankMaps).SingleAsync();
+            part.Ips.Should().Be("1354749");
+            part.Designation.Should().Be("07.053.00.002");
+            part.Name.Should().Be("Диск тормозной");
+            var map = part.BlankMaps.Single();
+            map.ConsumptionQuantity.Should().Be(0.025m);
+            map.ConsumptionUnit.Should().Be(BlankDemandPlanner.Core.Enums.MeasurementUnit.Meter);
+            var alias = await db.BlankAliases.SingleAsync();
+            alias.OneCCode.Should().Be("УТ000007475");
+            alias.SourceName.Should().Contain("D330");
+        }
+        finally
+        {
+            if (File.Exists(dbPath))
+            {
+                File.Delete(dbPath);
+            }
+
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Msk_headerless_library_file_reads_full_blank_name_format()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"bdp_msk_full_blank_{Guid.NewGuid():N}.db");
+        var filePath = Path.Combine(Path.GetTempPath(), $"Данные из МСК_{Guid.NewGuid():N}.xlsx");
+        try
+        {
+            using (var package = new ExcelPackage())
+            {
+                var sheet = package.Workbook.Worksheets.Add("Лист1");
+                sheet.Cells[1, 1].Value = "1320756";
+                sheet.Cells[1, 2].Value = "КПТ-04.00.001А01";
+                sheet.Cells[1, 3].Value = "Втулка внутренняя";
+                sheet.Cells[1, 4].Value = "Круг";
+                sheet.Cells[1, 5].Value = "Круг D80 Сталь 40Х ГОСТ 2590-2006 / ГОСТ 4543-2016";
+                sheet.Cells[1, 6].Value = "Сталь 40Х";
+                sheet.Cells[1, 7].Value = "УТ000022657";
+                sheet.Cells[1, 8].Value = "ГОСТ 4543-2016";
+                sheet.Cells[1, 9].Value = "ГОСТ 2590-2006";
+                sheet.Cells[1, 10].Value = "пог. м";
+                sheet.Cells[1, 11].Value = 0.065m;
+                await package.SaveAsAsync(new FileInfo(filePath));
+            }
+
+            var options = new DbContextOptionsBuilder<BlankDemandPlannerDbContext>()
+                .UseSqlite($"Data Source={dbPath};Pooling=False")
+                .Options;
+            await using var db = new BlankDemandPlannerDbContext(options);
+            await db.Database.MigrateAsync();
+
+            var importer = new ExcelImportService(db, new BlankNormalizationService(), new I012ValidationService(db), NullLogger<ExcelImportService>.Instance);
+            var report = await importer.ImportManufacturingBlankLibraryAsync(filePath, null, CancellationToken.None);
+
+            report.ReadRows.Should().Be(1);
+            report.SkippedRows.Should().Be(0);
+            var part = await db.Parts.Include(x => x.BlankMaps).SingleAsync();
+            part.Ips.Should().Be("1320756");
+            part.Designation.Should().Be("КПТ-04.00.001А01");
+            part.Name.Should().Be("Втулка внутренняя");
+            var map = part.BlankMaps.Single();
+            map.ConsumptionQuantity.Should().Be(0.065m);
+            map.ConsumptionUnit.Should().Be(BlankDemandPlanner.Core.Enums.MeasurementUnit.Meter);
+            var alias = await db.BlankAliases.Include(x => x.CanonicalBlank).SingleAsync();
+            alias.OneCCode.Should().Be("УТ000022657");
+            alias.SourceName.Should().Be("Круг D80 Сталь 40Х ГОСТ 2590-2006 / ГОСТ 4543-2016");
+            alias.CanonicalBlank!.DiameterMm.Should().Be(80);
+        }
+        finally
+        {
+            if (File.Exists(dbPath))
+            {
+                File.Delete(dbPath);
+            }
+
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Msk_headerless_import_restores_archived_library_part()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"bdp_msk_restore_archived_{Guid.NewGuid():N}.db");
+        var filePath = Path.Combine(Path.GetTempPath(), $"Данные из МСК_{Guid.NewGuid():N}.xlsx");
+        try
+        {
+            using (var package = new ExcelPackage())
+            {
+                var sheet = package.Workbook.Worksheets.Add("Лист1");
+                sheet.Cells[1, 1].Value = "1354749";
+                sheet.Cells[1, 2].Value = "07.053.00.002";
+                sheet.Cells[1, 3].Value = "Диск тормозной";
+                sheet.Cells[1, 4].Value = "Круг";
+                sheet.Cells[1, 5].Value = "D330";
+                sheet.Cells[1, 6].Value = "Сталь 40Х";
+                sheet.Cells[1, 9].Value = 0.025m;
+                sheet.Cells[1, 10].Value = "пог. м";
+                sheet.Cells[1, 11].Value = "УТ000007475";
+                sheet.Cells[1, 12].Value = "Круг D330 Сталь 40Х";
+                await package.SaveAsAsync(new FileInfo(filePath));
+            }
+
+            var options = new DbContextOptionsBuilder<BlankDemandPlannerDbContext>()
+                .UseSqlite($"Data Source={dbPath};Pooling=False")
+                .Options;
+            await using var db = new BlankDemandPlannerDbContext(options);
+            await db.Database.MigrateAsync();
+            db.Parts.Add(new Part { Ips = "1354749", Name = "Удаленная деталь", Source = "Потребность [ARCHIVED_LIBRARY] test" });
+            await db.SaveChangesAsync();
+
+            var importer = new ExcelImportService(db, new BlankNormalizationService(), new I012ValidationService(db), NullLogger<ExcelImportService>.Instance);
+            await importer.ImportManufacturingBlankLibraryAsync(filePath, null, CancellationToken.None);
+            var viewModel = new LibraryViewModel(db, new BlankNormalizationService());
+            await viewModel.LoadAsync();
+
+            viewModel.Rows.Should().ContainSingle(x => x.Ips == "1354749");
+            var restoredPart = await db.Parts.AsNoTracking().SingleAsync(x => x.Ips == "1354749");
+            restoredPart.Source.Should().NotContain("[ARCHIVED_LIBRARY]");
+            restoredPart.Name.Should().Be("Диск тормозной");
+        }
+        finally
+        {
+            if (File.Exists(dbPath))
+            {
+                File.Delete(dbPath);
+            }
+
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Msk_headerless_import_restores_archived_nsi_blank_and_alias()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"bdp_msk_restore_nsi_{Guid.NewGuid():N}.db");
+        var filePath = Path.Combine(Path.GetTempPath(), $"Данные из МСК_{Guid.NewGuid():N}.xlsx");
+        try
+        {
+            using (var package = new ExcelPackage())
+            {
+                var sheet = package.Workbook.Worksheets.Add("Лист1");
+                sheet.Cells[1, 1].Value = "1354749";
+                sheet.Cells[1, 2].Value = "07.053.00.002";
+                sheet.Cells[1, 3].Value = "Диск тормозной";
+                sheet.Cells[1, 4].Value = "Круг";
+                sheet.Cells[1, 5].Value = "D330";
+                sheet.Cells[1, 6].Value = "Сталь 40Х";
+                sheet.Cells[1, 9].Value = 0.025m;
+                sheet.Cells[1, 10].Value = "пог. м";
+                sheet.Cells[1, 11].Value = "УТ000007475";
+                sheet.Cells[1, 12].Value = "Круг D330 Сталь 40Х";
+                await package.SaveAsAsync(new FileInfo(filePath));
+            }
+
+            var options = new DbContextOptionsBuilder<BlankDemandPlannerDbContext>()
+                .UseSqlite($"Data Source={dbPath};Pooling=False")
+                .Options;
+            await using var db = new BlankDemandPlannerDbContext(options);
+            await db.Database.MigrateAsync();
+            var archivedBlank = new CanonicalBlank
+            {
+                CanonicalName = "Круг D330 Сталь 40Х",
+                CanonicalKey = "ROUNDBAR|D330|M:СТАЛЬ 40Х",
+                BlankType = BlankDemandPlanner.Core.Enums.BlankType.RoundBar,
+                DiameterMm = 330,
+                Material = "Сталь 40Х",
+                BaseUnit = BlankDemandPlanner.Core.Enums.MeasurementUnit.Meter,
+                IsActive = false
+            };
+            db.BlankAliases.Add(new BlankAlias
+            {
+                CanonicalBlank = archivedBlank,
+                OneCCode = "УТ000007475",
+                SourceName = "Круг D330 Сталь 40Х",
+                NormalizedSourceName = "Круг D330 Сталь 40Х",
+                Source = "Архив НСИ",
+                IsActive = false
+            });
+            await db.SaveChangesAsync();
+
+            var importer = new ExcelImportService(db, new BlankNormalizationService(), new I012ValidationService(db), NullLogger<ExcelImportService>.Instance);
+            await importer.ImportManufacturingBlankLibraryAsync(filePath, null, CancellationToken.None);
+
+            var alias = await db.BlankAliases.Include(x => x.CanonicalBlank).SingleAsync(x => x.OneCCode == "УТ000007475");
+            alias.IsActive.Should().BeTrue();
+            alias.CanonicalBlank!.IsActive.Should().BeTrue();
+            var viewModel = new LibraryViewModel(db, new BlankNormalizationService());
+            await viewModel.LoadAsync();
+            viewModel.Rows.Should().ContainSingle(x => x.Ips == "1354749" && x.OneCCode == "УТ000007475");
+        }
+        finally
+        {
+            if (File.Exists(dbPath))
+            {
+                File.Delete(dbPath);
+            }
+
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+            }
+        }
+    }
+
+    [Fact]
     public async Task Real_enterprise_files_import_without_entity_save_errors()
     {
         var root = FindWorkspaceRoot();

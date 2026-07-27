@@ -32,6 +32,8 @@ public sealed record ImportProgress(int ReadRows, int ProcessedRows, int AddedRo
 
 public sealed record ImportReport(int ReadRows, int AddedRows, int UpdatedRows, int SkippedRows, int ErrorRows, IReadOnlyList<string> Errors);
 
+public sealed record OneCStockSyncReport(int ReadRows, int AddedRows, int WarehouseRows, int WipRows, DateTime SyncedAt, IReadOnlyList<string> Errors);
+
 public sealed record ExcelColumnMapping(string ProgramField, string ExcelColumn);
 
 public sealed record ExcelPreview(string FilePath, string SheetName, int HeaderRowNumber, IReadOnlyList<string> Headers, IReadOnlyList<IReadOnlyList<string>> Rows);
