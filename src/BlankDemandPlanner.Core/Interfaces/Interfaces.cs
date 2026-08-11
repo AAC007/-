@@ -60,6 +60,23 @@ public interface IOneCStockSyncService
     Task<OneCStockSyncReport> SyncAsync(CancellationToken cancellationToken);
 }
 
+public interface IOneCNomenclatureService
+{
+    Task<IReadOnlyList<OneCNomenclatureItem>> SearchAsync(string query, int limit, CancellationToken cancellationToken);
+    Task<IReadOnlyList<OneCNomenclatureItem>> ResolveByCodesAsync(IEnumerable<string> codes, CancellationToken cancellationToken);
+    Task<IReadOnlyList<OneCNomenclaturePrice>> ResolvePricesByCodesAsync(IEnumerable<string> codes, CancellationToken cancellationToken);
+}
+
+public interface IOneCProductionLaunchService
+{
+    Task<OneCProductionLaunchResult> CreateAssemblyAsync(OneCProductionLaunchRequest request, CancellationToken cancellationToken);
+}
+
+public interface IOneCGoodsTransferService
+{
+    Task<OneCGoodsTransferResult> CreateTransferAsync(OneCGoodsTransferRequest request, CancellationToken cancellationToken);
+}
+
 public interface IReportExportService
 {
     Task<string> ExportCalculationRunAsync(long calculationRunId, string outputDirectory, CancellationToken cancellationToken);

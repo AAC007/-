@@ -216,7 +216,7 @@ public sealed partial class BlankNormalizationService : IBlankNormalizationServi
         BlankType.IBeam => "Двутавр",
         BlankType.BronzeBar => "Пруток бронзовый",
         BlankType.BronzeSheet => "Лист бронзовый",
-        BlankType.WeldingElement => "Сварочный элемент",
+        BlankType.WeldingElement => "Сварное изделие",
         BlankType.Purchased => "Покупная",
         BlankType.Casting => "Литье",
         BlankType.Forging => "Поковка",

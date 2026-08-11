@@ -9,10 +9,13 @@
 
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.2" />
+    <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.7" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="PdfiumViewer" Version="2.13.0" />
+    <PackageReference Include="PdfiumViewer.Native.x86_64.v8-xfa" Version="2018.4.8.256" />
     <PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />
     <PackageReference Include="Serilog.Extensions.Logging" Version="8.0.0" />
     <PackageReference Include="Serilog.Sinks.File" Version="5.0.0" />
@@ -22,6 +25,9 @@
     <Resource Include="Assets\pzmc-logo.png" />
     <Resource Include="Assets\pzmc-symbol.png" />
     <Resource Include="Assets\pzmc-logo-black-transparent.png" />
+    <Resource Include="Assets\PZMC_.png" />
+    <Resource Include="Assets\PZMC_1.png" />
+    <Resource Include="Assets\PZMC_1.ico" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -30,6 +36,28 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>Планирование ЦМО</AssemblyName>
+    <Product>Планирование ЦМО</Product>
+    <FileDescription>Планирование ЦМО</FileDescription>
+    <Version>2026.8.11.1</Version>
+    <AssemblyVersion>2026.8.11.1</AssemblyVersion>
+    <FileVersion>2026.8.11.1</FileVersion>
+    <InformationalVersion>v2026.08.11.1-object-card-developer-fixes</InformationalVersion>
+    <ApplicationIcon>Assets\PZMC_1.ico</ApplicationIcon>
+    <PdfiumNativePath>$(NuGetPackageRoot)pdfiumviewer.native.x86_64.v8-xfa\2018.4.8.256\Build\x64\pdfium.dll</PdfiumNativePath>
   </PropertyGroup>
+
+  <Target Name="CopyPdfiumNativeToOutput" AfterTargets="Build">
+    <MakeDir Directories="$(TargetDir)x64" />
+    <Copy SourceFiles="$(PdfiumNativePath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(PdfiumNativePath)" DestinationFolder="$(TargetDir)x64" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyPdfiumNativeToPublish" AfterTargets="Publish">
+    <MakeDir Directories="$(PublishDir)x64" />
+    <Copy SourceFiles="$(PdfiumNativePath)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(PdfiumNativePath)" DestinationFolder="$(PublishDir)x64" SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>

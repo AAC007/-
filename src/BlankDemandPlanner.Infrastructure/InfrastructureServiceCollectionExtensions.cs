@@ -3,6 +3,7 @@ using BlankDemandPlanner.Infrastructure.Backup;
 using BlankDemandPlanner.Infrastructure.Excel;
 using BlankDemandPlanner.Infrastructure.Export;
 using BlankDemandPlanner.Infrastructure.OneC;
+using BlankDemandPlanner.Infrastructure.PzmcProduction;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace BlankDemandPlanner.Infrastructure;
@@ -21,7 +22,12 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddScoped<IExcelImportProfile, StockImportProfile>();
         services.AddScoped<IExcelImportService, ExcelImportService>();
         services.AddScoped<IOneCStockSyncService, OneCStockSyncService>();
+        services.AddScoped<IOneCNomenclatureService, OneCNomenclatureService>();
+        services.AddScoped<IOneCProductionLaunchService, OneCProductionLaunchService>();
+        services.AddScoped<IOneCGoodsTransferService, OneCGoodsTransferService>();
         services.AddScoped<IReportExportService, ReportExportService>();
+        services.AddScoped<IPzmcProductionApiClient, PzmcProductionApiClient>();
+        services.AddScoped<IPzmcNeedExportService, PzmcNeedExportService>();
         services.AddSingleton<IDatabaseBackupService>(provider =>
             new DatabaseBackupService(databasePath, backupDirectory, keepBackups, provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DatabaseBackupService>>()));
         return services;

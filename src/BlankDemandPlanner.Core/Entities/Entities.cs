@@ -13,6 +13,12 @@ public sealed class Part : Entity
     public string? Designation { get; set; }
     public string Name { get; set; } = string.Empty;
     public bool HasMsk { get; set; }
+    public bool RequiresNitriding { get; set; }
+    public bool RequiresHeatTreatment { get; set; }
+    public bool RequiresChemicalOxidation { get; set; }
+    public bool RequiresKeyway { get; set; }
+    public bool BlankSupplyRequiresHeatTreatment { get; set; }
+    public bool BlankSupplyRequiresLaserCutting { get; set; }
     public string? Source { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
@@ -121,6 +127,17 @@ public sealed class StockItem : Entity
     public string? Warehouse { get; set; }
 }
 
+public sealed class OneCPriceItem : Entity
+{
+    public string LookupKey { get; set; } = string.Empty;
+    public string Code { get; set; } = string.Empty;
+    public string Article { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+    public string Currency { get; set; } = string.Empty;
+    public string PriceType { get; set; } = string.Empty;
+    public DateTime SyncedAt { get; set; } = DateTime.UtcNow;
+}
+
 public sealed class CalculationRun : Entity
 {
     public DateTime StartedAt { get; set; } = DateTime.UtcNow;
@@ -203,6 +220,40 @@ public sealed class ImportRun : Entity
     public ICollection<ImportError> Errors { get; set; } = new List<ImportError>();
 }
 
+public sealed class AppUser : Entity
+{
+    public string UserName { get; set; } = string.Empty;
+    public string NormalizedUserName { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public string PasswordHash { get; set; } = string.Empty;
+    public bool IsAdmin { get; set; }
+    public bool IsActive { get; set; } = true;
+    public bool MustChangePassword { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime? LastLoginAt { get; set; }
+    public ICollection<AppUserPermission> Permissions { get; set; } = new List<AppUserPermission>();
+}
+
+public sealed class AppUserPermission : Entity
+{
+    public long AppUserId { get; set; }
+    public AppUser? AppUser { get; set; }
+    public string PageKey { get; set; } = string.Empty;
+    public bool CanRead { get; set; }
+    public bool CanEdit { get; set; }
+}
+
+public sealed class AuthLoginAttempt : Entity
+{
+    public string UserName { get; set; } = string.Empty;
+    public string NormalizedUserName { get; set; } = string.Empty;
+    public bool IsSuccess { get; set; }
+    public string? FailureReason { get; set; }
+    public string? MachineName { get; set; }
+    public DateTime AttemptedAt { get; set; } = DateTime.UtcNow;
+}
+
 public sealed class ImportError : Entity
 {
     public long ImportRunId { get; set; }
@@ -235,4 +286,71 @@ public sealed class AppLog : Entity
     public string Level { get; set; } = string.Empty;
     public string Message { get; set; } = string.Empty;
     public string? Exception { get; set; }
+}
+
+public sealed class ProductionEquipment : Entity
+{
+    public string Code { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public string? Model { get; set; }
+    public string ResourceGroup { get; set; } = string.Empty;
+    public decimal CapacityPerHour { get; set; } = 1m;
+    public decimal EfficiencyFactor { get; set; } = 1m;
+    public string Status { get; set; } = "Доступно";
+    public string? MaintenanceSchedule { get; set; }
+    public bool IsActive { get; set; } = true;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+}
+
+public sealed class ProductionEmployee : Entity
+{
+    public string PersonnelNumber { get; set; } = string.Empty;
+    public string FullName { get; set; } = string.Empty;
+    public string Specialty { get; set; } = string.Empty;
+    public int QualificationLevel { get; set; } = 1;
+    public int ShiftStartHour { get; set; } = 8;
+    public int ShiftEndHour { get; set; } = 17;
+    public decimal MaxHoursPerWeek { get; set; } = 40m;
+    public bool IsAvailable { get; set; } = true;
+    public string? AbsenceReason { get; set; }
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+}
+
+public sealed class ProductionRouteOperation : Entity
+{
+    public string Ips { get; set; } = string.Empty;
+    public int Sequence { get; set; }
+    public string OperationCode { get; set; } = string.Empty;
+    public string Description { get; set; } = string.Empty;
+    public string EquipmentGroup { get; set; } = string.Empty;
+    public string RequiredSpecialty { get; set; } = string.Empty;
+    public int MinimumQualification { get; set; } = 1;
+    public decimal SetupMinutes { get; set; }
+    public decimal PieceMinutes { get; set; }
+    public decimal MachineMinutes { get; set; }
+    public decimal AuxiliaryMinutes { get; set; }
+    public bool CanRunInParallel { get; set; }
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+}
+
+public sealed class ProductionScheduleEntry : Entity
+{
+    public long DemandItemId { get; set; }
+    public long RouteOperationId { get; set; }
+    public long EquipmentId { get; set; }
+    public long EmployeeId { get; set; }
+    public string OrderNumber { get; set; } = string.Empty;
+    public string Ips { get; set; } = string.Empty;
+    public string PartName { get; set; } = string.Empty;
+    public string OperationCode { get; set; } = string.Empty;
+    public string OperationName { get; set; } = string.Empty;
+    public string EquipmentName { get; set; } = string.Empty;
+    public string EmployeeName { get; set; } = string.Empty;
+    public decimal Quantity { get; set; }
+    public int Priority { get; set; }
+    public DateTime PlannedStart { get; set; }
+    public DateTime PlannedEnd { get; set; }
+    public DateTime DueDate { get; set; }
+    public string Status { get; set; } = "Запланировано";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }

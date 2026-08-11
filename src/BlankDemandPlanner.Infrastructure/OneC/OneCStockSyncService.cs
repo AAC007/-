@@ -28,19 +28,60 @@ public sealed class OneCStockSyncService(
     public async Task<OneCStockSyncReport> SyncAsync(CancellationToken cancellationToken)
     {
         var root = FindWorkspaceRoot();
-        var scriptPath = Path.Combine(root, "onec_integration", "tools", "sync_stock_sections.py");
-        var outPath = Path.Combine(root, "onec_integration", "reports", "stock_sections_sync.json");
         var pythonPath = File.Exists(DefaultPythonPath) ? DefaultPythonPath : "python";
+        var odataScriptPath = Path.Combine(root, "onec_integration", "tools", "sync_stock_sections_odata.py");
+        var odataOutPath = Path.Combine(root, "onec_integration", "reports", "stock_sections_sync_odata.json");
+        var comScriptPath = Path.Combine(root, "onec_integration", "tools", "sync_stock_sections.py");
+        var comOutPath = Path.Combine(root, "onec_integration", "reports", "stock_sections_sync.json");
 
-        if (!File.Exists(scriptPath))
+        if (!File.Exists(comScriptPath))
         {
-            throw new FileNotFoundException("Не найден скрипт синхронизации остатков 1С.", scriptPath);
+            throw new FileNotFoundException("Не найден резервный COM-скрипт синхронизации остатков 1С.", comScriptPath);
         }
 
         logger.LogInformation("1C stock sync start: WIP warehouses {WipWarehouses}, production warehouses {ProductionWarehouses}",
             string.Join("; ", StockWarehouseRules.WipWarehouseFilters),
             string.Join("; ", StockWarehouseRules.ProductionWarehouseFilters));
+        OneCStockSyncPayload payload;
+        ScriptRunResult run;
+        if (File.Exists(odataScriptPath))
+        {
+            try
+            {
+                using var odataCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                odataCts.CancelAfter(TimeSpan.FromSeconds(20));
+                run = await RunSyncScriptAsync(pythonPath, root, odataScriptPath, odataOutPath, odataCts.Token);
+                payload = await ReadPayloadAsync(odataOutPath, run, cancellationToken);
+                await SaveSnapshotAsync(payload, "OData", cancellationToken);
+                var odataReport = BuildReport(payload);
+                logger.LogInformation("1C stock sync finished via OData: rows {Rows}, stdout {Stdout}", odataReport.ReadRows, run.Stdout);
+                return odataReport;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "1C OData stock sync failed, fallback to COM/Python script.");
+            }
+        }
 
+        run = await RunSyncScriptAsync(pythonPath, root, comScriptPath, comOutPath, cancellationToken);
+        payload = await ReadPayloadAsync(comOutPath, run, cancellationToken);
+        await SaveSnapshotAsync(payload, "COM", cancellationToken);
+        var report = BuildReport(payload);
+        logger.LogInformation("1C stock sync finished via COM: rows {Rows}, stdout {Stdout}", report.ReadRows, run.Stdout);
+        return report;
+    }
+
+    private static OneCStockSyncReport BuildReport(OneCStockSyncPayload payload) =>
+        new(
+            payload.Rows.Count,
+            payload.Rows.Count,
+            payload.Rows.Count(x => x.Role == "production"),
+            payload.Rows.Count(x => x.Role == "wip"),
+            ParseDate(payload.GeneratedAt) ?? DateTime.UtcNow,
+            []);
+
+    private static async Task<ScriptRunResult> RunSyncScriptAsync(string pythonPath, string root, string scriptPath, string outPath, CancellationToken cancellationToken)
+    {
         var startInfo = new ProcessStartInfo
         {
             FileName = pythonPath,
@@ -67,40 +108,44 @@ public sealed class OneCStockSyncService(
         startInfo.ArgumentList.Add(outPath);
 
         using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Не удалось запустить синхронизацию остатков 1С.");
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.WaitForExitAsync(cancellationToken);
-        var stdout = await stdoutTask;
-        var stderr = await stderrTask;
+        try
+        {
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+            var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            await process.WaitForExitAsync(cancellationToken);
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
+            return new ScriptRunResult(process.ExitCode, stdout, stderr);
+        }
+        catch (OperationCanceledException) when (!process.HasExited)
+        {
+            process.Kill(entireProcessTree: true);
+            await process.WaitForExitAsync(CancellationToken.None);
+            throw new TimeoutException("Быстрый канал 1С не уложился в лимит времени и будет заменен резервным COM-запросом.");
+        }
+    }
 
+    private static async Task<OneCStockSyncPayload> ReadPayloadAsync(string outPath, ScriptRunResult run, CancellationToken cancellationToken)
+    {
         if (!File.Exists(outPath))
         {
-            throw new InvalidOperationException($"1С не сформировала файл остатков. Код завершения: {process.ExitCode}. {stderr}".Trim());
+            throw new InvalidOperationException($"1С не сформировала файл остатков. Код завершения: {run.ExitCode}. {run.Stderr}".Trim());
         }
 
         var payload = JsonSerializer.Deserialize<OneCStockSyncPayload>(await File.ReadAllTextAsync(outPath, cancellationToken), JsonOptions)
             ?? throw new InvalidOperationException("Не удалось прочитать результат синхронизации остатков 1С.");
-        if (!payload.Ok || payload.Errors.Count > 0 || process.ExitCode != 0)
+        if (!payload.Ok || payload.Errors.Count > 0 || run.ExitCode != 0)
         {
             var errors = payload.Errors.Count == 0
-                ? stderr
+                ? run.Stderr
                 : string.Join("; ", payload.Errors.Select(x => $"{x.Role}/{x.Warehouse}: {x.Error}"));
             throw new InvalidOperationException($"Синхронизация остатков 1С завершилась с ошибкой. {errors}".Trim());
         }
 
-        await SaveSnapshotAsync(payload, cancellationToken);
-        var report = new OneCStockSyncReport(
-            payload.Rows.Count,
-            payload.Rows.Count,
-            payload.Rows.Count(x => x.Role == "production"),
-            payload.Rows.Count(x => x.Role == "wip"),
-            ParseDate(payload.GeneratedAt) ?? DateTime.UtcNow,
-            []);
-        logger.LogInformation("1C stock sync finished: rows {Rows}, stdout {Stdout}", report.ReadRows, stdout);
-        return report;
+        return payload;
     }
 
-    private async Task SaveSnapshotAsync(OneCStockSyncPayload payload, CancellationToken cancellationToken)
+    private async Task SaveSnapshotAsync(OneCStockSyncPayload payload, string provider, CancellationToken cancellationToken)
     {
         var codeKeys = payload.Rows
             .Select(x => StockCodeNormalizer.NormalizeForComparison(x.Code))
@@ -118,7 +163,7 @@ public sealed class OneCStockSyncService(
         {
             SnapshotDate = ParseDate(payload.GeneratedAt) ?? DateTime.UtcNow,
             ImportedAt = DateTime.UtcNow,
-            SourceFile = $"1С НЗП/ЦМО: {StockWarehouseRules.WipWarehouseSummary}; склад: {StockWarehouseRules.ProductionWarehouseSummary}"
+            SourceFile = $"1С {provider} НЗП/ЦМО: {StockWarehouseRules.WipWarehouseSummary}; склад: {StockWarehouseRules.ProductionWarehouseSummary}"
         };
         dbContext.StockSnapshots.Add(snapshot);
 
@@ -187,4 +232,5 @@ public sealed class OneCStockSyncService(
     private sealed record OneCStockSyncPayload(bool Ok, string? GeneratedAt, List<OneCStockSyncRow> Rows, List<OneCStockSyncError> Errors);
     private sealed record OneCStockSyncRow(string? Role, string? Code, string? Article, string? Name, string? Unit, string? WarehouseCode, string? Warehouse, string? Quantity);
     private sealed record OneCStockSyncError(string? Role, string? Warehouse, string? Error);
+    private sealed record ScriptRunResult(int ExitCode, string Stdout, string Stderr);
 }

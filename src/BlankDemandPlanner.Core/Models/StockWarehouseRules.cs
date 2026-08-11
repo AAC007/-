@@ -53,6 +53,9 @@ public static class StockWarehouseRules
             text.Contains("Основной склад", StringComparison.OrdinalIgnoreCase);
     }
 
+    public static bool IsProductionLaunchMaterialWarehouse(string? warehouse) =>
+        IsProductionWarehouse(warehouse) || IsCmoWipWarehouse(warehouse);
+
     public static string WipWarehouseSummary => string.Join("; ", WipWarehouseDisplayNames);
     public static string ProductionWarehouseSummary => string.Join("; ", ProductionWarehouseDisplayNames);
 

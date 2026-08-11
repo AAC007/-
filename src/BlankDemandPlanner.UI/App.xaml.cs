@@ -10,6 +10,10 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Serilog;
+using Application = System.Windows.Application;
+using MessageBox = System.Windows.MessageBox;
+using FormsApplication = System.Windows.Forms.Application;
+using UnhandledExceptionMode = System.Windows.Forms.UnhandledExceptionMode;
 
 namespace BlankDemandPlanner.UI;
 
@@ -20,6 +24,7 @@ public partial class App : Application
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        ConfigurePdfiumNativeSearchPath();
         var russianCulture = CultureInfo.GetCultureInfo("ru-RU");
         CultureInfo.DefaultThreadCurrentCulture = russianCulture;
         CultureInfo.DefaultThreadCurrentUICulture = russianCulture;
@@ -27,13 +32,18 @@ public partial class App : Application
         DispatcherUnhandledException += (_, args) =>
         {
             Log.Error(args.Exception, "Unhandled dispatcher exception");
-            MessageBox.Show("Произошла ошибка. Подробности записаны в лог.", "Заказ заготовок для ЦМО", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show("Произошла ошибка. Подробности записаны в лог.", "Планирование ЦМО", MessageBoxButton.OK, MessageBoxImage.Error);
             args.Handled = true;
         };
         TaskScheduler.UnobservedTaskException += (_, args) =>
         {
             Log.Error(args.Exception, "Unobserved task exception");
             args.SetObserved();
+        };
+        FormsApplication.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        FormsApplication.ThreadException += (_, args) =>
+        {
+            Log.Error(args.Exception, "Unhandled Windows Forms exception");
         };
         AppDomain.CurrentDomain.UnhandledException += (_, args) => Log.Error(args.ExceptionObject as Exception, "Unhandled domain exception");
 
@@ -64,6 +74,8 @@ public partial class App : Application
                 services.AddBlankDemandPlannerServices();
                 services.AddBlankDemandPlannerInfrastructure(databasePath, backupPath, keepBackups: 14);
                 services.AddSingleton<IFileDialogService, FileDialogService>();
+                services.AddSingleton<IAppAuthService, AppAuthService>();
+                services.AddTransient<LoginWindow>();
                 services.AddTransient<MainViewModel>();
                 services.AddTransient<MainWindow>();
             })
@@ -74,10 +86,38 @@ public partial class App : Application
         {
             var db = scope.ServiceProvider.GetRequiredService<BlankDemandPlannerDbContext>();
             await db.Database.MigrateAsync();
+            await db.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
+            await db.Database.ExecuteSqlRawAsync("PRAGMA busy_timeout=5000;");
+        }
+
+        ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        var loginWindow = _host.Services.GetRequiredService<LoginWindow>();
+        if (loginWindow.ShowDialog() != true)
+        {
+            Shutdown();
+            return;
         }
 
         var window = _host.Services.GetRequiredService<MainWindow>();
+        MainWindow = window;
+        ShutdownMode = ShutdownMode.OnMainWindowClose;
         window.Show();
+    }
+
+    private static void ConfigurePdfiumNativeSearchPath()
+    {
+        var appDirectory = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var pdfiumDirectory = Path.Combine(appDirectory, "x64");
+        var currentPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        var paths = currentPath.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
+        var additions = new[] { appDirectory, pdfiumDirectory }
+            .Where(Directory.Exists)
+            .Where(path => !paths.Any(existing => string.Equals(
+                existing.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                path,
+                StringComparison.OrdinalIgnoreCase)));
+
+        Environment.SetEnvironmentVariable("PATH", string.Join(Path.PathSeparator, additions.Concat(paths)));
     }
 
     private static string FindStableDataDirectory(string fallbackAppData)

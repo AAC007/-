@@ -13,6 +13,8 @@ public sealed class BlankDemandCalculationService(
     IUnitConversionService unitConversionService,
     ILogger<BlankDemandCalculationService> logger) : IBlankDemandCalculationService
 {
+    private const decimal MeterCutWidth = 0.005m;
+
     public async Task<CalculationRun> CalculateAsync(CalculationOptions options, CancellationToken cancellationToken)
     {
         logger.LogInformation("Calculation start for demand batch {DemandBatchId}", options.DemandBatchId);
@@ -46,7 +48,7 @@ public sealed class BlankDemandCalculationService(
                 .Where(x => x.StockSnapshotId == stockSnapshotId)
                 .ToListAsync(cancellationToken);
         stocks = stocks
-            .Where(x => StockWarehouseRules.IsProductionWarehouse(x.Warehouse))
+            .Where(x => StockWarehouseRules.IsProductionLaunchMaterialWarehouse(x.Warehouse))
             .Where(x => x.BlankAliasId is not null && aliasIds.Contains(x.BlankAliasId.Value) ||
                 aliasKeys.Contains(StockCodeNormalizer.NormalizeForComparison(x.OneCCode)))
             .ToList();
@@ -140,7 +142,9 @@ public sealed class BlankDemandCalculationService(
                     run.Items.Add(item);
                 }
 
-                item.TotalRequired += requiredWithLoss;
+                var cutAllowance = CalculateCutAllowance(map.ConsumptionUnit, effectiveDemandQuantity, item.Sources.Count);
+                var requiredWithCut = requiredWithLoss + cutAllowance;
+                item.TotalRequired += requiredWithCut;
                 item.Sources.Add(new CalculationItemSource
                 {
                     Ips = demand.Ips,
@@ -175,6 +179,19 @@ public sealed class BlankDemandCalculationService(
         var used = Math.Min(demandQuantity, inProduction);
         workInProgressByIps[key] = inProduction - used;
         return demandQuantity - used;
+    }
+
+    private static decimal CalculateCutAllowance(MeasurementUnit unit, decimal effectiveDemandQuantity, int existingSourceCount)
+    {
+        if (unit != MeasurementUnit.Meter || effectiveDemandQuantity <= 0)
+        {
+            return 0;
+        }
+
+        var pieceCount = (int)Math.Ceiling(effectiveDemandQuantity);
+        var cutsInsideDemandLine = Math.Max(0, pieceCount - 1);
+        var cutBeforeDemandLine = existingSourceCount > 0 ? 1 : 0;
+        return (cutsInsideDemandLine + cutBeforeDemandLine) * MeterCutWidth;
     }
 
     private static void AddProblem(CalculationRun run, IDictionary<(long? BlankId, MeasurementUnit Unit, CalculationStatus Status, string Key), CalculationItem> groups, DemandItem demand, CalculationStatus status, string comment)

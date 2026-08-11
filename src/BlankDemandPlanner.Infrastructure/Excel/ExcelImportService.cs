@@ -253,15 +253,7 @@ public sealed class ExcelImportService(
                 continue;
             }
 
-            var part = IsDemandLibraryPartCandidate(row, ips)
-                ? await FindPartAsync(ips, cancellationToken)
-                : null;
-            if (part is null && IsDemandLibraryPartCandidate(row, ips))
-            {
-                var (designation, name) = SplitDesignationAndName(Get(row, "PartName"));
-                part = new Part { Ips = ips, Designation = designation, Name = FirstNotEmpty(name, Get(row, "PartName"), "Из потребности"), Source = Path.GetFileName(filePath) };
-                dbContext.Parts.Add(part);
-            }
+            var part = await FindOrCreateDemandPartAsync(row, ips, filePath, cancellationToken);
 
             dbContext.DemandItems.Add(new DemandItem
             {
@@ -305,6 +297,7 @@ public sealed class ExcelImportService(
             .ToListAsync(cancellationToken);
 
         var updatedItems = new HashSet<long>();
+        var demandDates = new List<DateTime>();
         var sequentialIndex = 0;
 
         await foreach (var row in EnumerateRowsAsync(filePath, new DemandImportProfile(), cancellationToken))
@@ -322,22 +315,35 @@ public sealed class ExcelImportService(
             var item = FindExistingDemandItem(existingItems, updatedItems, sequentialIndex, ips, quantity.Value, demandDate);
             if (item is null)
             {
-                report.SkippedRows++;
+                var newPart = await FindOrCreateDemandPartAsync(row, ips, filePath, cancellationToken);
+
+                dbContext.DemandItems.Add(new DemandItem
+                {
+                    DemandBatch = batch,
+                    Part = newPart,
+                    Ips = ips,
+                    SourcePartName = Get(row, "PartName"),
+                    Project = Get(row, "Project"),
+                    SerialNumber = Get(row, "SerialNumber"),
+                    Unit = Get(row, "Unit"),
+                    Quantity = quantity.Value,
+                    DemandDate = demandDate,
+                    ProductionSystem = Get(row, "ProductionSystem")
+                });
+                if (demandDate is not null)
+                {
+                    demandDates.Add(demandDate.Value);
+                }
+
+                report.AddedRows++;
+                await SaveBatchAsync(report, progress, cancellationToken);
                 continue;
             }
 
             updatedItems.Add(item.Id);
             sequentialIndex = Math.Max(sequentialIndex + 1, existingItems.IndexOf(item) + 1);
 
-            var part = IsDemandLibraryPartCandidate(row, ips)
-                ? await FindPartAsync(ips, cancellationToken)
-                : null;
-            if (part is null && IsDemandLibraryPartCandidate(row, ips))
-            {
-                var (designation, name) = SplitDesignationAndName(Get(row, "PartName"));
-                part = new Part { Ips = ips, Designation = designation, Name = FirstNotEmpty(name, Get(row, "PartName"), "Из потребности"), Source = Path.GetFileName(filePath) };
-                dbContext.Parts.Add(part);
-            }
+            var part = await FindOrCreateDemandPartAsync(row, ips, filePath, cancellationToken);
 
             item.Ips = ips;
             item.Part = part;
@@ -348,19 +354,20 @@ public sealed class ExcelImportService(
             item.Quantity = quantity.Value;
             item.DemandDate = demandDate;
             item.ProductionSystem = Get(row, "ProductionSystem");
+            if (demandDate is not null)
+            {
+                demandDates.Add(demandDate.Value);
+            }
+
             report.UpdatedRows++;
 
             await SaveBatchAsync(report, progress, cancellationToken);
         }
 
-        var dates = existingItems
-            .Where(x => updatedItems.Contains(x.Id) && x.DemandDate is not null)
-            .Select(x => x.DemandDate!.Value)
-            .ToList();
-        if (dates.Count > 0)
+        if (demandDates.Count > 0)
         {
-            batch.PeriodFrom = dates.Min();
-            batch.PeriodTo = dates.Max();
+            batch.PeriodFrom = demandDates.Min();
+            batch.PeriodTo = demandDates.Max();
         }
 
         batch.SourceFile = filePath;
@@ -892,6 +899,41 @@ public sealed class ExcelImportService(
         return local ?? await dbContext.Parts.FirstOrDefaultAsync(x => x.Ips == ips, cancellationToken);
     }
 
+    private async Task<Part?> FindOrCreateDemandPartAsync(IReadOnlyDictionary<string, string> row, string ips, string filePath, CancellationToken cancellationToken)
+    {
+        if (!IsDemandLibraryPartCandidate(row, ips))
+        {
+            return null;
+        }
+
+        var partName = Get(row, "PartName");
+        var (designation, name) = SplitDesignationAndName(partName);
+        var sourceFile = Path.GetFileName(filePath);
+        var part = await FindPartAsync(ips, cancellationToken);
+        if (part is null)
+        {
+            part = new Part
+            {
+                Ips = ips,
+                Designation = designation,
+                Name = FirstNotEmpty(name, partName, "Из потребности"),
+                Source = sourceFile
+            };
+            dbContext.Parts.Add(part);
+            return part;
+        }
+
+        if (IsArchivedLibrarySource(part.Source))
+        {
+            part.Source = RestoreLibrarySource(part.Source, sourceFile);
+            part.Designation = FirstNotEmpty(designation, part.Designation);
+            part.Name = FirstNotEmpty(name, part.Name, partName, "Из потребности");
+            part.UpdatedAt = DateTime.UtcNow;
+        }
+
+        return part;
+    }
+
     private async Task<BlankAlias?> FindAliasAsync(string oneCCode, CancellationToken cancellationToken)
     {
         var local = dbContext.ChangeTracker.Entries<BlankAlias>()
@@ -1088,6 +1130,11 @@ public sealed class ExcelImportService(
 
     private static string Get(IReadOnlyDictionary<string, string> row, string key) => row.TryGetValue(key, out var value) ? value.Trim() : string.Empty;
     private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? string.Empty;
+    private static bool IsArchivedLibrarySource(string? source) =>
+        !string.IsNullOrWhiteSpace(source) &&
+        (source.Contains("[ARCHIVED_LIBRARY]", StringComparison.OrdinalIgnoreCase) ||
+         source.Contains("Удалено из библиотеки", StringComparison.OrdinalIgnoreCase));
+
     private static string RestoreLibrarySource(string? source, string importedFileName)
     {
         if (string.IsNullOrWhiteSpace(source))
@@ -1118,8 +1165,13 @@ public sealed class ExcelImportService(
             return false;
         }
 
+        if (!IsValidDemandPartIps(ips))
+        {
+            return false;
+        }
+
         var name = Get(row, "PartName");
-        if (string.IsNullOrWhiteSpace(ips) || string.IsNullOrWhiteSpace(name))
+        if (string.IsNullOrWhiteSpace(name))
         {
             return false;
         }
@@ -1136,6 +1188,14 @@ public sealed class ExcelImportService(
 
         var (designation, partName) = SplitDesignationAndName(name);
         return !string.IsNullOrWhiteSpace(designation) && !string.IsNullOrWhiteSpace(partName);
+    }
+
+    private static bool IsValidDemandPartIps(string? value)
+    {
+        var text = (value ?? string.Empty).Trim();
+        return text.Length is >= 6 and <= 11 &&
+            text.Any(ch => ch != '0') &&
+            text.All(char.IsDigit);
     }
 
     private static (string? Designation, string Name) SplitDesignationAndName(string? value)

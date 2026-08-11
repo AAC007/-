@@ -2,6 +2,7 @@ using BlankDemandPlanner.Core.Interfaces;
 using BlankDemandPlanner.Services.Calculation;
 using BlankDemandPlanner.Services.Duplicates;
 using BlankDemandPlanner.Services.Normalization;
+using BlankDemandPlanner.Services.Planning;
 using BlankDemandPlanner.Services.Validation;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -16,6 +17,9 @@ public static class ServiceCollectionExtensions
         services.AddScoped<IBlankDemandCalculationService, BlankDemandCalculationService>();
         services.AddScoped<IUnitConversionService, UnitConversionService>();
         services.AddScoped<IDuplicateDetectionService, DuplicateDetectionService>();
+        services.AddScoped<IProductionPlanningService, ProductionPlanningService>();
+        services.AddScoped<IPzmcNeedService, PzmcNeedService>();
+        services.AddScoped<IPzmcPersonnelAvailabilityService, PzmcPersonnelAvailabilityService>();
         return services;
     }
 }

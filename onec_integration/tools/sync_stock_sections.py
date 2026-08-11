@@ -44,11 +44,10 @@ def main() -> int:
     }
 
     for role, warehouses in (("wip", args.wip_warehouse), ("production", args.production_warehouse)):
-        for warehouse in warehouses:
-            try:
-                result["rows"].extend(query_positive_stock(base, warehouse, role))
-            except Exception as exc:
-                result["errors"].append({"warehouse": warehouse, "role": role, "error": str(exc)})
+        try:
+            result["rows"].extend(query_positive_stock(base, warehouses, role))
+        except Exception as exc:
+            result["errors"].append({"warehouse": "; ".join(warehouses), "role": role, "error": str(exc)})
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -62,7 +61,22 @@ def main() -> int:
     return 0 if not result["errors"] else 2
 
 
-def query_positive_stock(base: Any, warehouse: str, role: str) -> list[dict[str, str]]:
+def query_positive_stock(base: Any, warehouses: list[str], role: str) -> list[dict[str, str]]:
+    conditions: list[str] = []
+    prepared: list[tuple[str, str, str]] = []
+    for index, warehouse in enumerate(x.strip() for x in warehouses if x.strip()):
+        exact_name = f"WarehouseExact{index}"
+        pattern_name = f"WarehouseSectionPattern{index}"
+        conditions.append(
+            f"(Склад.Код = &{exact_name} "
+            f"ИЛИ Склад.Наименование = &{exact_name} "
+            f"ИЛИ Склад.Наименование ПОДОБНО &{pattern_name})"
+        )
+        prepared.append((exact_name, pattern_name, warehouse))
+    if not prepared:
+        return []
+
+    warehouse_condition = "\n             ИЛИ ".join(conditions)
     query_text = f"""
     ВЫБРАТЬ
         Остатки.Номенклатура.Код КАК code,
@@ -74,16 +88,15 @@ def query_positive_stock(base: Any, warehouse: str, role: str) -> list[dict[str,
         Остатки.КоличествоОстаток КАК quantity
     ИЗ
         РегистрНакопления.{MAIN_REGISTER}.Остатки(,
-            (Склад.Код = &WarehouseExact
-             ИЛИ Склад.Наименование = &WarehouseExact
-             ИЛИ Склад.Наименование ПОДОБНО &WarehouseSectionPattern)) КАК Остатки
+            ({warehouse_condition})) КАК Остатки
     ГДЕ
         Остатки.КоличествоОстаток > 0
     """
     query = base.NewObject("Запрос")
     query.Text = query_text
-    query.SetParameter("WarehouseExact", warehouse.strip())
-    query.SetParameter("WarehouseSectionPattern", f"{warehouse.strip()} секция%")
+    for exact_name, pattern_name, warehouse in prepared:
+        query.SetParameter(exact_name, warehouse)
+        query.SetParameter(pattern_name, f"{warehouse} секция%")
     selection = query.Execute().Choose()
 
     rows: list[dict[str, str]] = []

@@ -13,6 +13,7 @@ public sealed class BlankDemandPlannerDbContext(DbContextOptions<BlankDemandPlan
     public DbSet<DemandItem> DemandItems => Set<DemandItem>();
     public DbSet<StockSnapshot> StockSnapshots => Set<StockSnapshot>();
     public DbSet<StockItem> StockItems => Set<StockItem>();
+    public DbSet<OneCPriceItem> OneCPriceItems => Set<OneCPriceItem>();
     public DbSet<CalculationRun> CalculationRuns => Set<CalculationRun>();
     public DbSet<CalculationItem> CalculationItems => Set<CalculationItem>();
     public DbSet<CalculationItemSource> CalculationItemSources => Set<CalculationItemSource>();
@@ -24,6 +25,13 @@ public sealed class BlankDemandPlannerDbContext(DbContextOptions<BlankDemandPlan
     public DbSet<ChangeHistory> ChangeHistory => Set<ChangeHistory>();
     public DbSet<AppSetting> Settings => Set<AppSetting>();
     public DbSet<AppLog> Logs => Set<AppLog>();
+    public DbSet<ProductionEquipment> ProductionEquipment => Set<ProductionEquipment>();
+    public DbSet<ProductionEmployee> ProductionEmployees => Set<ProductionEmployee>();
+    public DbSet<ProductionRouteOperation> ProductionRouteOperations => Set<ProductionRouteOperation>();
+    public DbSet<ProductionScheduleEntry> ProductionScheduleEntries => Set<ProductionScheduleEntry>();
+    public DbSet<AppUser> AppUsers => Set<AppUser>();
+    public DbSet<AppUserPermission> AppUserPermissions => Set<AppUserPermission>();
+    public DbSet<AuthLoginAttempt> AuthLoginAttempts => Set<AuthLoginAttempt>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -74,6 +82,16 @@ public sealed class BlankDemandPlannerDbContext(DbContextOptions<BlankDemandPlan
             entity.HasIndex(x => x.BlankAliasId);
         });
 
+        modelBuilder.Entity<OneCPriceItem>(entity =>
+        {
+            entity.Property(x => x.LookupKey).HasMaxLength(64);
+            entity.Property(x => x.Code).HasMaxLength(64);
+            entity.Property(x => x.Article).HasMaxLength(64);
+            entity.Property(x => x.Currency).HasMaxLength(32);
+            entity.Property(x => x.PriceType).HasMaxLength(128);
+            entity.HasIndex(x => x.LookupKey).IsUnique();
+        });
+
         modelBuilder.Entity<I012CatalogEntry>(entity =>
         {
             entity.HasIndex(x => new { x.BlankType, x.SizeKey, x.MaterialKey }).IsUnique();
@@ -82,6 +100,66 @@ public sealed class BlankDemandPlannerDbContext(DbContextOptions<BlankDemandPlan
         modelBuilder.Entity<MskRecord>().HasIndex(x => x.Ips).IsUnique();
         modelBuilder.Entity<ImportProfile>().HasIndex(x => new { x.ProfileType, x.ProfileName }).IsUnique();
         modelBuilder.Entity<AppSetting>().HasIndex(x => x.Key).IsUnique();
+
+        modelBuilder.Entity<ProductionEquipment>(entity =>
+        {
+            entity.Property(x => x.Code).HasMaxLength(64);
+            entity.Property(x => x.Name).HasMaxLength(256);
+            entity.Property(x => x.ResourceGroup).HasMaxLength(128);
+            entity.HasIndex(x => x.Code).IsUnique();
+            entity.HasIndex(x => x.ResourceGroup);
+        });
+
+        modelBuilder.Entity<ProductionEmployee>(entity =>
+        {
+            entity.Property(x => x.PersonnelNumber).HasMaxLength(64);
+            entity.Property(x => x.FullName).HasMaxLength(256);
+            entity.Property(x => x.Specialty).HasMaxLength(128);
+            entity.HasIndex(x => x.PersonnelNumber).IsUnique();
+            entity.HasIndex(x => x.Specialty);
+        });
+
+        modelBuilder.Entity<ProductionRouteOperation>(entity =>
+        {
+            entity.Property(x => x.Ips).HasMaxLength(64);
+            entity.Property(x => x.OperationCode).HasMaxLength(64);
+            entity.Property(x => x.EquipmentGroup).HasMaxLength(128);
+            entity.Property(x => x.RequiredSpecialty).HasMaxLength(128);
+            entity.HasIndex(x => new { x.Ips, x.Sequence }).IsUnique();
+            entity.HasIndex(x => x.Ips);
+        });
+
+        modelBuilder.Entity<ProductionScheduleEntry>(entity =>
+        {
+            entity.HasIndex(x => x.PlannedStart);
+            entity.HasIndex(x => x.EquipmentId);
+            entity.HasIndex(x => x.EmployeeId);
+            entity.HasIndex(x => x.DemandItemId);
+        });
+
+        modelBuilder.Entity<AppUser>(entity =>
+        {
+            entity.Property(x => x.UserName).HasMaxLength(64);
+            entity.Property(x => x.NormalizedUserName).HasMaxLength(64);
+            entity.Property(x => x.DisplayName).HasMaxLength(256);
+            entity.Property(x => x.PasswordHash).HasMaxLength(256);
+            entity.HasIndex(x => x.NormalizedUserName).IsUnique();
+        });
+
+        modelBuilder.Entity<AppUserPermission>(entity =>
+        {
+            entity.Property(x => x.PageKey).HasMaxLength(64);
+            entity.HasIndex(x => new { x.AppUserId, x.PageKey }).IsUnique();
+        });
+
+        modelBuilder.Entity<AuthLoginAttempt>(entity =>
+        {
+            entity.Property(x => x.UserName).HasMaxLength(64);
+            entity.Property(x => x.NormalizedUserName).HasMaxLength(64);
+            entity.Property(x => x.FailureReason).HasMaxLength(256);
+            entity.Property(x => x.MachineName).HasMaxLength(128);
+            entity.HasIndex(x => new { x.NormalizedUserName, x.AttemptedAt });
+        });
 
         foreach (var entityType in modelBuilder.Model.GetEntityTypes())
         {

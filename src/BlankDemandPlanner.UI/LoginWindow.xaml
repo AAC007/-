@@ -1,0 +1,69 @@
+<Window x:Class="BlankDemandPlanner.UI.LoginWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Вход - Планирование ЦМО"
+        Height="560"
+        Width="640"
+        MinHeight="500"
+        MinWidth="560"
+        ResizeMode="CanResize"
+        WindowStartupLocation="CenterScreen"
+        Background="#F6F8FA">
+    <Window.Resources>
+        <Style TargetType="{x:Type TextBox}">
+            <Setter Property="MinHeight" Value="36" />
+            <Setter Property="Padding" Value="8,5" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+        <Style TargetType="{x:Type PasswordBox}">
+            <Setter Property="MinHeight" Value="36" />
+            <Setter Property="Padding" Value="8,5" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+        <Style TargetType="{x:Type ComboBox}">
+            <Setter Property="MinHeight" Value="36" />
+            <Setter Property="Padding" Value="6,4" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+        <Style TargetType="{x:Type Button}">
+            <Setter Property="MinHeight" Value="34" />
+            <Setter Property="Padding" Value="14,4" />
+        </Style>
+    </Window.Resources>
+
+    <Border Margin="20" Padding="22" Background="White" BorderBrush="#D0D7DE" BorderThickness="1" CornerRadius="8">
+        <DockPanel LastChildFill="True">
+            <StackPanel DockPanel.Dock="Bottom" Margin="0,18,0,0">
+                <TextBlock x:Name="StatusText" Foreground="#CF222E" TextWrapping="Wrap" MinHeight="36" />
+
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button Content="Отмена" MinWidth="110" Margin="0,0,10,0" Click="Cancel_Click" />
+                    <Button x:Name="SubmitButton" Content="Войти" MinWidth="180" IsDefault="True" Click="Submit_Click" />
+                </StackPanel>
+            </StackPanel>
+
+            <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel MaxWidth="520">
+                    <TextBlock Text="Планирование ЦМО" FontSize="24" FontWeight="SemiBold" />
+                    <TextBlock x:Name="ModeText" Text="Вход в приложение" Margin="0,8,0,18" Foreground="#57606A" TextWrapping="Wrap" />
+
+                    <TextBlock Text="Логин" />
+                    <ComboBox x:Name="UserNameBox"
+                              Margin="0,4,0,14"
+                              IsEditable="True"
+                              IsTextSearchEnabled="True"
+                              StaysOpenOnEdit="True" />
+
+                    <TextBlock Text="Отображаемое имя" x:Name="DisplayNameLabel" />
+                    <TextBox x:Name="DisplayNameBox" Margin="0,4,0,14" />
+
+                    <TextBlock Text="Пароль" />
+                    <PasswordBox x:Name="PasswordBox" Margin="0,4,0,14" />
+
+                    <TextBlock Text="Повторите пароль" x:Name="ConfirmPasswordLabel" />
+                    <PasswordBox x:Name="ConfirmPasswordBox" Margin="0,4,0,2" />
+                </StackPanel>
+            </ScrollViewer>
+        </DockPanel>
+    </Border>
+</Window>

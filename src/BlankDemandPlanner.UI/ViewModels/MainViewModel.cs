@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Globalization;
@@ -11,6 +11,8 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Forms.Integration;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using BlankDemandPlanner.Core.Entities;
@@ -25,6 +27,18 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
 using OfficeOpenXml;
+using PdfiumViewer;
+using Application = System.Windows.Application;
+using Binding = System.Windows.Data.Binding;
+using Brushes = System.Windows.Media.Brushes;
+using Button = System.Windows.Controls.Button;
+using ComboBox = System.Windows.Controls.ComboBox;
+using FontFamily = System.Windows.Media.FontFamily;
+using HorizontalAlignment = System.Windows.HorizontalAlignment;
+using MessageBox = System.Windows.MessageBox;
+using OpenFileDialog = Microsoft.Win32.OpenFileDialog;
+using SaveFileDialog = Microsoft.Win32.SaveFileDialog;
+using TextBox = System.Windows.Controls.TextBox;
 
 namespace BlankDemandPlanner.UI.ViewModels;
 
@@ -33,18 +47,28 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly BlankDemandPlannerDbContext _dbContext;
     private readonly IExcelImportService _excelImportService;
     private readonly IOneCStockSyncService _oneCStockSyncService;
+    private readonly IOneCNomenclatureService _oneCNomenclatureService;
+    private readonly IOneCProductionLaunchService _oneCProductionLaunchService;
     private readonly IBlankDemandCalculationService _calculationService;
     private readonly IFileDialogService _fileDialogService;
+    private readonly IAppAuthService _authService;
     private readonly ILogger<MainViewModel> _logger;
 
     public ObservableCollection<NavigationItem> NavigationItems { get; } = [];
 
     [ObservableProperty] private NavigationItem? selectedNavigationItem;
     [ObservableProperty] private object? currentPage;
+    [ObservableProperty] private bool canEditCurrentPage = true;
     [ObservableProperty] private string? globalSearch;
     [ObservableProperty] private string undoStatusText = "Отменить";
     [ObservableProperty] private string stockSyncStatusText = "Остатки 1С: не обновлялись";
     [ObservableProperty] private bool isStockSyncRunning;
+
+    public string WindowTitle { get; } = "Планирование ЦМО";
+    public string ApplicationTitle { get; } = AppVersionInfo.Current.ApplicationTitle;
+    public string CurrentUserText => _authService.CurrentUser is null
+        ? "Пользователь не определен"
+        : $"{_authService.CurrentUser.DisplayName} ({(_authService.CurrentUser.IsAdmin ? "админ" : "пользователь")})";
 
     public DashboardViewModel Dashboard { get; }
     public DemandViewModel Demand { get; }
@@ -55,35 +79,61 @@ public sealed partial class MainViewModel : ObservableObject
     public BlankSelectionViewModel BlankSelection { get; }
     public HistoryViewModel History { get; }
     public SettingsViewModel Settings { get; }
+    public DeveloperModeViewModel DeveloperMode { get; }
     public MskViewModel Msk { get; }
+    public ProductionPlanViewModel Plan { get; }
+    public WorkshopReportViewModel WorkshopReport { get; }
 
     public MainViewModel(
         BlankDemandPlannerDbContext dbContext,
         IExcelImportService excelImportService,
         IOneCStockSyncService oneCStockSyncService,
+        IOneCNomenclatureService oneCNomenclatureService,
+        IOneCProductionLaunchService oneCProductionLaunchService,
+        IOneCGoodsTransferService oneCGoodsTransferService,
         IBlankDemandCalculationService calculationService,
         IBlankNormalizationService normalizationService,
         IReportExportService reportExportService,
         IFileDialogService fileDialogService,
+        IProductionPlanningService productionPlanningService,
+        IPzmcNeedService pzmcNeedService,
+        IPzmcNeedExportService pzmcNeedExportService,
+        IPzmcPersonnelAvailabilityService pzmcPersonnelAvailabilityService,
+        IPzmcProductionApiClient pzmcProductionApiClient,
+        IAppAuthService authService,
         ILogger<MainViewModel> logger)
     {
         _dbContext = dbContext;
         _excelImportService = excelImportService;
         _oneCStockSyncService = oneCStockSyncService;
+        _oneCNomenclatureService = oneCNomenclatureService;
+        _oneCProductionLaunchService = oneCProductionLaunchService;
         _calculationService = calculationService;
         _fileDialogService = fileDialogService;
+        _authService = authService;
         _logger = logger;
 
+        var drawingService = new IpsBridgeDrawingService();
         Dashboard = new DashboardViewModel(dbContext);
-        Demand = new DemandViewModel(dbContext, excelImportService);
-        Library = new LibraryViewModel(dbContext, normalizationService, excelImportService, fileDialogService, reportExportService);
-        Normalization = new NormalizationViewModel(dbContext, excelImportService, fileDialogService);
+        Demand = new DemandViewModel(dbContext, excelImportService, drawingService, logger);
+        Library = new LibraryViewModel(dbContext, normalizationService, excelImportService, fileDialogService, reportExportService, drawingService, logger);
+        Normalization = new NormalizationViewModel(dbContext, excelImportService, fileDialogService, oneCNomenclatureService);
         Stock = new StockViewModel(dbContext);
-        Calculation = new CalculationViewModel(dbContext, calculationService, reportExportService, fileDialogService);
-        BlankSelection = new BlankSelectionViewModel(dbContext);
+        Calculation = new CalculationViewModel(dbContext, calculationService, reportExportService, fileDialogService, drawingService, logger);
+        BlankSelection = new BlankSelectionViewModel(dbContext, drawingService, logger);
         History = new HistoryViewModel();
-        Settings = new SettingsViewModel(dbContext);
-        Msk = new MskViewModel(dbContext, logger, new IpsBridgeDrawingService(), autoOpenDrawings: true);
+        Settings = new SettingsViewModel(dbContext, authService);
+        DeveloperMode = new DeveloperModeViewModel(dbContext, authService, RefreshReferenceListsAsync);
+        Msk = new MskViewModel(dbContext, logger, drawingService, oneCProductionLaunchService, oneCGoodsTransferService);
+        Plan = new ProductionPlanViewModel(
+            dbContext,
+            productionPlanningService,
+            pzmcNeedService,
+            pzmcNeedExportService,
+            pzmcPersonnelAvailabilityService,
+            pzmcProductionApiClient,
+            fileDialogService);
+        WorkshopReport = new WorkshopReportViewModel(dbContext, pzmcPersonnelAvailabilityService);
         UndoCenter.Changed += (_, _) => UndoStatusText = UndoCenter.StatusText;
 
         NavigationItems.Add(new NavigationItem("Главная", Dashboard));
@@ -92,18 +142,58 @@ public sealed partial class MainViewModel : ObservableObject
         NavigationItems.Add(new NavigationItem("Библиотека", Library));
         NavigationItems.Add(new NavigationItem("НСИ", Normalization));
         NavigationItems.Add(new NavigationItem("Подбор заготовок", BlankSelection));
-        NavigationItems.Add(new NavigationItem("МСК", Msk));
+        NavigationItems.Add(new NavigationItem("Планирование", Msk));
+        NavigationItems.Add(new NavigationItem("Отчет", WorkshopReport));
+        NavigationItems.Add(new NavigationItem("План", Plan));
         NavigationItems.Add(new NavigationItem("История", History));
         NavigationItems.Add(new NavigationItem("Настройки", Settings));
+        NavigationItems.Add(new NavigationItem("Режим разработчика", DeveloperMode));
+        ApplyNavigationPermissions();
         SelectedNavigationItem = NavigationItems[0];
         _ = Dashboard.LoadAsync();
         _ = Settings.LoadAsync();
         _ = SyncStockFromOneCCoreAsync(showMessage: false);
     }
 
+    private void ApplyNavigationPermissions()
+    {
+        for (var i = NavigationItems.Count - 1; i >= 0; i--)
+        {
+            var item = NavigationItems[i];
+            var pageKey = GetPageKey(item.Page);
+            var canRead = pageKey == "Settings" || _authService.CanRead(pageKey);
+            if (!canRead)
+            {
+                NavigationItems.RemoveAt(i);
+                continue;
+            }
+
+            NavigationItems[i] = item with { PageKey = pageKey, CanEdit = pageKey == "Settings" || _authService.CanEdit(pageKey) };
+        }
+    }
+
+    private string GetPageKey(object page)
+    {
+        if (ReferenceEquals(page, Dashboard)) return "Dashboard";
+        if (ReferenceEquals(page, Demand)) return "Demand";
+        if (ReferenceEquals(page, Calculation)) return "Calculation";
+        if (ReferenceEquals(page, Library)) return "Library";
+        if (ReferenceEquals(page, Normalization)) return "Normalization";
+        if (ReferenceEquals(page, BlankSelection)) return "BlankSelection";
+        if (ReferenceEquals(page, Msk)) return "Planning";
+        if (ReferenceEquals(page, WorkshopReport)) return "WorkshopReport";
+        if (ReferenceEquals(page, Plan)) return "Plan";
+        if (ReferenceEquals(page, History)) return "History";
+        if (ReferenceEquals(page, Settings)) return "Settings";
+        if (ReferenceEquals(page, DeveloperMode)) return "DeveloperMode";
+        return string.Empty;
+    }
+
     partial void OnSelectedNavigationItemChanged(NavigationItem? value)
     {
         CurrentPage = value?.Page;
+        CanEditCurrentPage = value?.CanEdit != false;
+        ApplyGlobalSearchToPage(value?.Page);
         if (value?.Page == Library)
         {
             _ = Library.LoadAsync();
@@ -128,6 +218,14 @@ public sealed partial class MainViewModel : ObservableObject
         {
             _ = Msk.LoadAsync();
         }
+        else if (value?.Page == Plan)
+        {
+            _ = Plan.LoadAsync();
+        }
+        else if (value?.Page == WorkshopReport)
+        {
+            _ = WorkshopReport.LoadAsync();
+        }
         else if (value?.Page == Normalization)
         {
             _ = Normalization.LoadAsync();
@@ -144,25 +242,59 @@ public sealed partial class MainViewModel : ObservableObject
         {
             _ = Settings.LoadAsync();
         }
+        else if (value?.Page == DeveloperMode)
+        {
+            _ = DeveloperMode.LoadAsync();
+        }
+    }
+
+    private async Task RefreshReferenceListsAsync()
+    {
+        await UiReferenceData.LoadAsync(_dbContext);
+        Library.RefreshReferenceLists();
+        Normalization.RefreshReferenceLists();
+        BlankSelection.RefreshReferenceLists();
+        Calculation.RefreshReferenceLists();
     }
 
     partial void OnGlobalSearchChanged(string? value)
     {
-        Library.Search = value ?? string.Empty;
-        if (CurrentPage == Library)
+        ApplyGlobalSearchToPage(CurrentPage);
+    }
+
+    private void ApplyGlobalSearchToPage(object? page)
+    {
+        var search = GlobalSearch ?? string.Empty;
+        if (page == Demand)
         {
-            _ = Library.LoadAsync();
+            Demand.Search = search;
         }
-        else if (CurrentPage == Normalization)
+        else if (page == Library)
         {
-            Normalization.Search = value ?? string.Empty;
-            _ = Normalization.LoadAsync();
+            Library.Search = search;
+        }
+        else if (page == Normalization)
+        {
+            Normalization.Search = search;
+        }
+        else if (page == Stock)
+        {
+            Stock.Search = search;
+        }
+        else if (page == Calculation)
+        {
+            Calculation.Search = search;
+        }
+        else if (page == Msk)
+        {
+            Msk.Search = search;
         }
     }
 
     [RelayCommand]
     private async Task RefreshAsync()
     {
+        await RefreshReferenceListsAsync();
         await Dashboard.LoadAsync();
         await Demand.LoadAsync();
         await Library.LoadAsync();
@@ -175,6 +307,8 @@ public sealed partial class MainViewModel : ObservableObject
         await Settings.LoadAsync();
     }
 
+    public async Task StartupLoadAsync() => await RefreshAsync();
+
     [RelayCommand]
     private async Task ImportDemandAsync()
     {
@@ -186,12 +320,13 @@ public sealed partial class MainViewModel : ObservableObject
 
         try
         {
-            var beforeIps = (await _dbContext.Parts.AsNoTracking().Select(x => x.Ips).ToListAsync())
+            var beforeIps = (await _dbContext.Parts.AsNoTracking()
+                    .Where(x => x.Source == null || !x.Source.Contains("[ARCHIVED_LIBRARY]"))
+                    .Select(x => x.Ips)
+                    .ToListAsync())
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
             var report = await _excelImportService.ImportDemandAsync(file, null, CancellationToken.None);
             _dbContext.ChangeTracker.Clear();
-            var afterIps = await _dbContext.Parts.AsNoTracking().Select(x => x.Ips).ToListAsync();
-            var newPartCount = afterIps.Count(x => !beforeIps.Contains(x));
 
             SelectedNavigationItem = NavigationItems.First(x => x.Page == Demand);
             CurrentPage = Demand;
@@ -199,13 +334,19 @@ public sealed partial class MainViewModel : ObservableObject
             await Dashboard.LoadAsync();
             await Library.LoadAsync();
             await BlankSelection.LoadAsync();
+            _dbContext.ChangeTracker.Clear();
 
-            if (newPartCount > 0)
+            var refreshedIps = await _dbContext.Parts.AsNoTracking()
+                .Where(x => x.Source == null || !x.Source.Contains("[ARCHIVED_LIBRARY]"))
+                .Select(x => x.Ips)
+                .ToListAsync();
+            var addedPartCount = refreshedIps.Count(x => !beforeIps.Contains(x));
+            if (addedPartCount > 0)
             {
-                Demand.StatusText = $"{Demand.StatusText}; добавлено новых деталей: {newPartCount}";
+                Demand.StatusText = $"{Demand.StatusText}; добавлено новых деталей: {addedPartCount}";
             }
 
-            MessageBox.Show($"Импорт потребности из ПП завершен.\nПрочитано строк: {report.ReadRows}\nДобавлено: {report.AddedRows}\nОбновлено: {report.UpdatedRows}\nПропущено: {report.SkippedRows}\nОшибок: {report.ErrorRows}\nДобавлено новых деталей в библиотеку: {newPartCount}", "Импорт", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show($"Импорт потребности из ПП завершен.\nПрочитано строк: {report.ReadRows}\nДобавлено: {report.AddedRows}\nОбновлено: {report.UpdatedRows}\nПропущено: {report.SkippedRows}\nОшибок: {report.ErrorRows}\nДобавлено новых деталей в библиотеку: {addedPartCount}", "Импорт", MessageBoxButton.OK, MessageBoxImage.Information);
         }
         catch (Exception ex)
         {
@@ -233,15 +374,22 @@ public sealed partial class MainViewModel : ObservableObject
         {
             var report = await _oneCStockSyncService.SyncAsync(CancellationToken.None);
             _dbContext.ChangeTracker.Clear();
+            var refreshedNsiNames = await Normalization.RefreshNamesFromOneCAsync(CancellationToken.None);
+            var refreshedPrices = await Normalization.RefreshPricesFromOneCAsync(CancellationToken.None);
             await Dashboard.LoadAsync();
             await Demand.LoadAsync();
             await Normalization.LoadAsync();
             await Stock.LoadAsync();
             await Calculation.LoadLastRunAsync();
-            StockSyncStatusText = $"Остатки 1С обновлены: {report.SyncedAt.ToLocalTime():dd.MM.yyyy HH:mm}; склад: {report.WarehouseRows}; НЗП/ЦМО: {report.WipRows}";
+            StockSyncStatusText = refreshedNsiNames > 0
+                ? $"Остатки 1С обновлены: {report.SyncedAt.ToLocalTime():dd.MM.yyyy HH:mm}; склад: {report.WarehouseRows}; НЗП/ЦМО: {report.WipRows}; НСИ: {refreshedNsiNames}; цены: {refreshedPrices}"
+                : $"Остатки 1С обновлены: {report.SyncedAt.ToLocalTime():dd.MM.yyyy HH:mm}; склад: {report.WarehouseRows}; НЗП/ЦМО: {report.WipRows}; цены: {refreshedPrices}";
             if (showMessage)
             {
-                MessageBox.Show($"Остатки 1С обновлены.\nСклад: {report.WarehouseRows} строк\nНЗП/ЦМО: {report.WipRows} строк\nДата: {report.SyncedAt.ToLocalTime():dd.MM.yyyy HH:mm}", "Обновление данных 1С", MessageBoxButton.OK, MessageBoxImage.Information);
+                var nsiLine = refreshedNsiNames > 0
+                    ? $"\nНаименований НСИ обновлено из 1С: {refreshedNsiNames}"
+                    : "\nНаименования НСИ сверены с 1С, изменений нет";
+                MessageBox.Show($"Остатки 1С обновлены.\nСклад: {report.WarehouseRows} строк\nНЗП/ЦМО: {report.WipRows} строк{nsiLine}\nЦен обновлено: {refreshedPrices}\nДата: {report.SyncedAt.ToLocalTime():dd.MM.yyyy HH:mm}", "Обновление данных 1С", MessageBoxButton.OK, MessageBoxImage.Information);
             }
         }
         catch (Exception ex)
@@ -361,11 +509,84 @@ public sealed partial class MainViewModel : ObservableObject
     }
 }
 
-public sealed record NavigationItem(string Title, object Page);
+public sealed record NavigationItem(string Title, object Page, string PageKey = "", bool CanEdit = false);
+
+public sealed record AppVersionInfo(string Version, string UpdatedAt)
+{
+    public static AppVersionInfo Current { get; } = Load();
+    public string ShortVersion { get; } = ToShortVersion(Version);
+    public string ApplicationTitle { get; } = $"Планирование ЦМО {ToShortVersion(Version)}";
+
+    public string SoftwareUpdateText =>
+        string.IsNullOrWhiteSpace(UpdatedAt)
+            ? $"Версия {ShortVersion}"
+            : $"{UpdatedAt}, версия {ShortVersion}";
+
+    public static string ToShortVersion(string version)
+    {
+        var match = Regex.Match(version.Trim(), @"^v\d{4}\.\d{2}\.\d{2}\.\d+");
+        return match.Success ? match.Value : version.Trim();
+    }
+
+    private static AppVersionInfo Load()
+    {
+        var path = FindProjectFile("VERSION.md");
+        if (path is not null)
+        {
+            foreach (var rawLine in File.ReadLines(path, Encoding.UTF8))
+            {
+                var line = rawLine.Trim();
+                if (line.StartsWith("## ", StringComparison.Ordinal))
+                {
+                    var (version, updatedAt) = ParseVersionHeading(line[3..].Trim());
+                    if (!string.IsNullOrWhiteSpace(version))
+                    {
+                        return new AppVersionInfo(version, updatedAt);
+                    }
+                }
+            }
+        }
+
+        return new AppVersionInfo("версия не определена", string.Empty);
+    }
+
+    private static (string Version, string UpdatedAt) ParseVersionHeading(string heading)
+    {
+        var separators = new[] { " — ", " - ", " | " };
+        foreach (var separator in separators)
+        {
+            var index = heading.IndexOf(separator, StringComparison.Ordinal);
+            if (index > 0)
+            {
+                return (heading[..index].Trim(), heading[(index + separator.Length)..].Trim());
+            }
+        }
+
+        return (heading.Trim(), string.Empty);
+    }
+
+    private static string? FindProjectFile(string fileName)
+    {
+        foreach (var basePath in new[] { AppContext.BaseDirectory, Environment.CurrentDirectory })
+        {
+            var directory = new DirectoryInfo(basePath);
+            for (var i = 0; directory is not null && i < 10; i++, directory = directory.Parent)
+            {
+                var path = Path.Combine(directory.FullName, fileName);
+                if (File.Exists(path))
+                {
+                    return path;
+                }
+            }
+        }
+
+        return null;
+    }
+}
 
 public sealed partial class DashboardViewModel(BlankDemandPlannerDbContext dbContext) : ObservableObject
 {
-    public string LastSoftwareUpdate { get; } = "27.07.2026, версия v2026.07.27.3";
+    public string LastSoftwareUpdate { get; } = AppVersionInfo.Current.SoftwareUpdateText;
     public string DeveloperInfo { get; } = "Разработал Codex с участием Аракеляна А.С.";
 
     [ObservableProperty] private int parts;
@@ -390,12 +611,16 @@ public sealed partial class DashboardViewModel(BlankDemandPlannerDbContext dbCon
         CanonicalBlanks = await activeAliases.CountAsync();
         PartsWithoutBlank = await activeParts.CountAsync(p => !p.BlankMaps.Any(m => m.IsActive));
         PartsWithoutMsk = await activeParts.CountAsync(p => !p.HasMsk);
-        var duplicateCounts = await activeAliases
-            .Where(x => x.NormalizedSourceName != "")
-            .GroupBy(x => x.NormalizedSourceName)
+        var duplicateAliases = await activeAliases
+            .Include(x => x.CanonicalBlank)
+            .ToListAsync();
+        var duplicateCounts = duplicateAliases
+            .Select(x => NsiDuplicateKey.Build(x.CanonicalBlank, x))
+            .Where(x => x.Length > 0)
+            .GroupBy(x => x, StringComparer.Ordinal)
             .Where(g => g.Count() > 1)
             .Select(g => g.Count())
-            .ToListAsync();
+            .ToList();
         DuplicateCandidates = duplicateCounts.Sum();
         OutsideI012 = await activeAliases.CountAsync(x => x.CanonicalBlank != null && x.CanonicalBlank.I012Status != I012Status.Allowed);
 
@@ -419,8 +644,14 @@ public sealed partial class DashboardViewModel(BlankDemandPlannerDbContext dbCon
     private static string? FormatDate(DateTime? value) => value?.ToLocalTime().ToString("g");
 }
 
-public sealed partial class DemandViewModel(BlankDemandPlannerDbContext dbContext, IExcelImportService? excelImportService = null) : ObservableObject
+public sealed partial class DemandViewModel(
+    BlankDemandPlannerDbContext dbContext,
+    IExcelImportService? excelImportService = null,
+    IIpsDrawingService? ipsDrawingService = null,
+    ILogger? logger = null) : ObservableObject
 {
+    private readonly IIpsDrawingService drawingService = ipsDrawingService ?? new IpsBridgeDrawingService();
+
     public ObservableCollection<DemandRow> Rows { get; } = [];
     public ObservableCollection<DemandDetailRow> DetailRows { get; } = [];
 
@@ -475,12 +706,25 @@ public sealed partial class DemandViewModel(BlankDemandPlannerDbContext dbContex
         if (!string.IsNullOrWhiteSpace(Search))
         {
             var searchValue = Search.Trim();
-            query = query.Where(x =>
-                (x.Project != null && x.Project.Contains(searchValue)) ||
-                (x.SerialNumber != null && x.SerialNumber.Contains(searchValue)) ||
-                (x.ProductionSystem != null && x.ProductionSystem.Contains(searchValue)) ||
-                (x.SourcePartName != null && x.SourcePartName.Contains(searchValue)) ||
-                x.Ips.Contains(searchValue));
+            var searchedItems = await query
+                .OrderBy(x => x.DemandDate)
+                .ThenBy(x => x.Project)
+                .ThenBy(x => x.SerialNumber)
+                .ThenBy(x => x.Id)
+                .Take(20000)
+                .ToListAsync();
+            searchedItems = searchedItems
+                .Where(x => UiSearchText.ContainsAnyField(searchValue,
+                    x.Project,
+                    x.SerialNumber,
+                    x.ProductionSystem,
+                    x.SourcePartName,
+                    x.Ips))
+                .Take(5000)
+                .ToList();
+
+            await LoadRowsAsync(searchedItems);
+            return;
         }
 
         var items = await query
@@ -491,6 +735,11 @@ public sealed partial class DemandViewModel(BlankDemandPlannerDbContext dbContex
             .Take(5000)
             .ToListAsync();
 
+        await LoadRowsAsync(items);
+    }
+
+    private async Task LoadRowsAsync(IReadOnlyCollection<DemandItem> items)
+    {
         var workInProgressByIps = await LoadWorkInProgressByIpsAsync(
             items.Select(x => x.Ips).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
 
@@ -530,6 +779,172 @@ public sealed partial class DemandViewModel(BlankDemandPlannerDbContext dbContex
         Rows.Insert(0, new DemandRow(0, string.Empty, string.Empty, string.Empty, string.Empty, "шт", "1", "0", "0", "0", DateTime.Today.ToString("dd.MM.yyyy"), true));
         StatusText = "Добавлена новая строка. Заполните IPS детали, количество и сохраните.";
     }
+
+    [RelayCommand]
+    private async Task OpenDrawingAsync(object? parameter)
+    {
+        var row = parameter as DemandRow ?? SelectedRow;
+        if (row is null)
+        {
+            StatusText = "Выберите строку потребности для открытия чертежа.";
+            return;
+        }
+
+        SelectedRow = row;
+        StatusText = await DrawingPdfOpener.OpenExternalAsync(
+            new DrawingLookupRequest(row.Ips, null, row.Name, null),
+            drawingService,
+            "Потребность",
+            logger,
+            CancellationToken.None);
+    }
+
+    [RelayCommand]
+    private async Task OpenObjectCardAsync(object? parameter)
+    {
+        var row = parameter as DemandRow ?? SelectedRow;
+        if (row is null)
+        {
+            StatusText = "Выберите строку для открытия карточки объекта.";
+            return;
+        }
+
+        SelectedRow = row;
+        PdfViewer? viewer = null;
+        PdfDocument? document = null;
+        WindowsFormsHost? host = null;
+        var status = new TextBlock
+        {
+            Text = "Поиск PDF-чертежа...",
+            Foreground = Brushes.DimGray,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 8, 0, 0)
+        };
+
+        var details = new TextBlock
+        {
+            Text = BuildObjectCardText(row),
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 14
+        };
+
+        var left = new ScrollViewer
+        {
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Content = new StackPanel
+            {
+                Margin = new Thickness(16),
+                Children =
+                {
+                    new TextBlock { Text = "Карточка объекта", FontSize = 22, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 12) },
+                    details,
+                    new TextBlock { Text = "2 маршрут обработки и трудоемкость", FontSize = 17, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 18, 0, 6) },
+                    new TextBlock { Text = "Данные маршрута пока не внесены.", TextWrapping = TextWrapping.Wrap, Foreground = Brushes.DimGray },
+                    new TextBlock { Text = "3 Оснащение и расход", FontSize = 17, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 18, 0, 6) },
+                    new TextBlock { Text = "Данные по оснащению и расходу пока не внесены.", TextWrapping = TextWrapping.Wrap, Foreground = Brushes.DimGray },
+                    status
+                }
+            }
+        };
+
+        try
+        {
+            viewer = new PdfViewer
+            {
+                Dock = System.Windows.Forms.DockStyle.Fill,
+                ZoomMode = PdfViewerZoomMode.FitWidth
+            };
+            host = new WindowsFormsHost { Child = viewer };
+        }
+        catch (Exception ex)
+        {
+            status.Text = $"PDF-viewer не запущен: {ex.GetBaseException().Message}";
+        }
+
+        var layout = new Grid();
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.42, GridUnitType.Star), MinWidth = 360 });
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.58, GridUnitType.Star), MinWidth = 420 });
+        layout.Children.Add(left);
+        var right = new Border
+        {
+            BorderBrush = Brushes.LightGray,
+            BorderThickness = new Thickness(1, 0, 0, 0),
+            Child = host is not null ? host : new TextBlock { Text = status.Text, Margin = new Thickness(16), TextWrapping = TextWrapping.Wrap }
+        };
+        Grid.SetColumn(right, 1);
+        layout.Children.Add(right);
+
+        var window = new Window
+        {
+            Title = $"Карточка объекта IPS {row.Ips}",
+            Owner = Application.Current?.MainWindow,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Width = 1180,
+            Height = 760,
+            MinWidth = 920,
+            MinHeight = 620,
+            Content = layout
+        };
+        window.Closed += (_, _) =>
+        {
+            if (viewer is not null)
+            {
+                viewer.Document = null;
+            }
+
+            if (host is not null)
+            {
+                host.Child = null;
+            }
+
+            viewer?.Dispose();
+            document?.Dispose();
+        };
+        window.Show();
+
+        if (viewer is null)
+        {
+            return;
+        }
+
+        var drawing = await DrawingPdfOpener.ResolveDrawingPdfAsync(
+            new DrawingLookupRequest(row.Ips, null, row.Name, null),
+            drawingService,
+            logger,
+            CancellationToken.None);
+        if (drawing is null)
+        {
+            status.Foreground = Brushes.Firebrick;
+            status.Text = $"PDF-чертеж IPS {row.Ips} не найден.";
+            return;
+        }
+
+        try
+        {
+            document = PdfDocument.Load(drawing.FullName);
+            viewer.Document = document;
+            viewer.ZoomMode = PdfViewerZoomMode.FitWidth;
+            status.Foreground = Brushes.SeaGreen;
+            status.Text = $"PDF-чертеж открыт: {drawing.Name}";
+        }
+        catch (Exception ex)
+        {
+            document?.Dispose();
+            document = null;
+            status.Foreground = Brushes.Firebrick;
+            status.Text = $"PDF найден, но viewer не смог открыть файл: {ex.GetBaseException().Message}";
+        }
+    }
+
+    private static string BuildObjectCardText(DemandRow row) =>
+        $"1 Информация по детали\n" +
+        $"IPS: {row.Ips}\n" +
+        $"Наименование: {row.Name}\n" +
+        $"Проект: {row.Project}\n" +
+        $"№ станка: {row.MachineNumber}\n" +
+        $"Количество: {row.Quantity} {row.UnitName}\n" +
+        $"В производстве: {row.InProductionQuantity}\n" +
+        $"Дата потребности: {row.DemandDate}";
 
     [RelayCommand]
     private async Task DeleteDemandRowsAsync(object? parameter)
@@ -602,9 +1017,12 @@ public sealed partial class DemandViewModel(BlankDemandPlannerDbContext dbContex
             .Where(x => string.Equals(x.Ips, row.Ips, StringComparison.OrdinalIgnoreCase))
             .ToList();
         var totalQuantity = details.Sum(x => TryParseDisplayQuantity(x.Quantity, out var quantity) ? quantity : 0m);
-        var totalInProduction = details.Sum(x => TryParseDisplayQuantity(x.InProductionQuantity, out var quantity) ? quantity : 0m);
+        var totalInProduction = details
+            .Select(x => TryParseDisplayQuantity(x.InProductionQuantity, out var quantity) ? quantity : 0m)
+            .DefaultIfEmpty(0m)
+            .Max();
         var deficit = Math.Max(0m, totalQuantity - totalInProduction);
-        DetailTitle = $"Детализация IPS {row.Ips}; всего деталей: {FormatDecimal(totalQuantity)}; дефицит: {FormatDecimal(deficit)}";
+        DetailTitle = $"Детализация IPS {row.Ips}; всего деталей: {FormatDecimal(totalQuantity)}; в производстве: {FormatDecimal(totalInProduction)}; дефицит: {FormatDecimal(deficit)}";
         foreach (var detail in details
             .Select(x => new DemandDetailRow(
                 x.DemandDate,
@@ -828,7 +1246,9 @@ public sealed partial class LibraryViewModel(
     IBlankNormalizationService normalizationService,
     IExcelImportService? excelImportService = null,
     IFileDialogService? fileDialogService = null,
-    IReportExportService? reportExportService = null) : ObservableObject
+    IReportExportService? reportExportService = null,
+    IIpsDrawingService? ipsDrawingService = null,
+    ILogger? logger = null) : ObservableObject
 {
     private static readonly BlankType[] MeterBasedBlankTypes =
     [
@@ -837,19 +1257,16 @@ public sealed partial class LibraryViewModel(
         BlankType.HexBar,
         BlankType.PipeRound,
         BlankType.PipeRectangular,
-        BlankType.Angle,
-        BlankType.Channel,
-        BlankType.IBeam,
-        BlankType.BronzeBar
+        BlankType.Angle
     ];
 
     public ObservableCollection<LibraryRow> Rows { get; } = [];
     public ObservableCollection<LibraryBlankOption> BlankSuggestions { get; } = [];
 
-    public IReadOnlyList<DisplayOption<BlankType>> BlankTypes { get; } = UiText.BlankTypes;
-    public IReadOnlyList<DisplayOption<MeasurementUnit>> UnitTypes { get; } = UiText.ConsumptionUnitTypes;
-    public IReadOnlyList<DisplayOption<BlankType?>> BlankTypeFilters { get; } = UiText.BlankTypeFilters;
-    public IReadOnlyList<DisplayOption<MeasurementUnit?>> UnitFilters { get; } = UiText.ConsumptionUnitFilters;
+    public ObservableCollection<DisplayOption<BlankType>> BlankTypes { get; } = [..UiReferenceData.BlankTypes()];
+    public ObservableCollection<DisplayOption<MeasurementUnit>> UnitTypes { get; } = [..UiReferenceData.ConsumptionUnitTypes()];
+    public ObservableCollection<DisplayOption<BlankType?>> BlankTypeFilters { get; } = [..UiReferenceData.BlankTypeFilters(includeUnknown: false)];
+    public ObservableCollection<DisplayOption<MeasurementUnit?>> UnitFilters { get; } = [..UiReferenceData.ConsumptionUnitFilters()];
     public IReadOnlyList<DisplayOption<bool?>> BlankStatusFilters { get; } =
     [
         new((bool?)null, "Все"),
@@ -858,31 +1275,52 @@ public sealed partial class LibraryViewModel(
     ];
 
     [ObservableProperty] private string search = string.Empty;
-    [ObservableProperty] private DisplayOption<BlankType?> selectedBlankTypeFilter = UiText.BlankTypeFilters[0];
-    [ObservableProperty] private DisplayOption<MeasurementUnit?> selectedUnitFilter = UiText.ConsumptionUnitFilters[0];
+    [ObservableProperty] private DisplayOption<BlankType?> selectedBlankTypeFilter = UiReferenceData.BlankTypeFilters(includeUnknown: false)[0];
+    [ObservableProperty] private DisplayOption<MeasurementUnit?> selectedUnitFilter = UiReferenceData.ConsumptionUnitFilters()[0];
     [ObservableProperty] private DisplayOption<bool?> selectedBlankStatusFilter = new(null, "Все");
+    [ObservableProperty] private bool demandOnly;
     [ObservableProperty] private string editIps = string.Empty;
     [ObservableProperty] private string editDesignation = string.Empty;
     [ObservableProperty] private string editPartName = string.Empty;
-    [ObservableProperty] private DisplayOption<BlankType> selectedBlankType = UiText.BlankTypes[0];
+    [ObservableProperty] private DisplayOption<BlankType> selectedBlankType = UiReferenceData.BlankTypes()[0];
     [ObservableProperty] private string blankSearch = string.Empty;
     [ObservableProperty] private LibraryBlankOption? selectedBlank;
     [ObservableProperty] private string selectedOneCCode = string.Empty;
     [ObservableProperty] private decimal consumptionQuantity = 1m;
     [ObservableProperty] private string consumptionQuantityText = "1";
     [ObservableProperty] private string blankLeadTimeDaysText = "30";
-    [ObservableProperty] private DisplayOption<MeasurementUnit> selectedUnit = UiText.UnitTypes[0];
+    [ObservableProperty] private bool editRequiresNitriding;
+    [ObservableProperty] private bool editRequiresHeatTreatment;
+    [ObservableProperty] private bool editRequiresChemicalOxidation;
+    [ObservableProperty] private bool editRequiresKeyway;
+    [ObservableProperty] private bool editBlankSupplyRequiresHeatTreatment;
+    [ObservableProperty] private bool editBlankSupplyRequiresLaserCutting;
+    [ObservableProperty] private DisplayOption<MeasurementUnit> selectedUnit = UiReferenceData.UnitTypes()[0];
     [ObservableProperty] private LibraryRow? selectedRow;
     [ObservableProperty] private string editSource = "Ручной ввод";
     [ObservableProperty] private string editorStatus = string.Empty;
     [ObservableProperty] private string summaryText = "Деталей: 0; без заготовки: 0";
     private bool suppressBlankSearchReload;
-    private bool suppressSelectedRowEditorLoad;
+    private readonly IIpsDrawingService drawingService = ipsDrawingService ?? new IpsBridgeDrawingService();
+
+    public string NitridingServiceLabel => UiReferenceData.ServiceName("Nitriding", "Азотирование");
+    public string HeatTreatmentServiceLabel => UiReferenceData.ServiceName("HeatTreatment", "ТО");
+    public string ChemicalOxidationServiceLabel => UiReferenceData.ServiceName("ChemicalOxidation", "Хим. окс");
+    public string KeywayServiceLabel => UiReferenceData.ServiceName("Keyway", "Шпон паз");
+    public bool IsNitridingServiceVisible => UiReferenceData.IsServiceActive("Nitriding");
+    public bool IsHeatTreatmentServiceVisible => UiReferenceData.IsServiceActive("HeatTreatment");
+    public bool IsChemicalOxidationServiceVisible => UiReferenceData.IsServiceActive("ChemicalOxidation");
+    public bool IsKeywayServiceVisible => UiReferenceData.IsServiceActive("Keyway");
+    public string BlankSupplyHeatTreatmentLabel => UiReferenceData.SupplyConditionName("HeatTreatment", "ТО");
+    public string BlankSupplyLaserCuttingLabel => UiReferenceData.SupplyConditionName("LaserCutting", "Лазерная резка");
+    public bool IsBlankSupplyHeatTreatmentVisible => UiReferenceData.IsSupplyConditionActive("HeatTreatment");
+    public bool IsBlankSupplyLaserCuttingVisible => UiReferenceData.IsSupplyConditionActive("LaserCutting");
 
     partial void OnSearchChanged(string value) => _ = LoadAsync();
     partial void OnSelectedBlankTypeFilterChanged(DisplayOption<BlankType?> value) => _ = LoadAsync();
     partial void OnSelectedUnitFilterChanged(DisplayOption<MeasurementUnit?> value) => _ = LoadAsync();
     partial void OnSelectedBlankStatusFilterChanged(DisplayOption<bool?> value) => _ = LoadAsync();
+    partial void OnDemandOnlyChanged(bool value) => _ = LoadAsync();
     partial void OnSelectedBlankTypeChanged(DisplayOption<BlankType> value) => _ = LoadBlankSuggestionsAsync();
     partial void OnBlankSearchChanged(string value)
     {
@@ -904,14 +1342,6 @@ public sealed partial class LibraryViewModel(
             ConsumptionQuantity = quantity;
         }
     }
-    partial void OnSelectedRowChanged(LibraryRow? value)
-    {
-        if (!suppressSelectedRowEditorLoad && value is not null)
-        {
-            _ = EditLibraryRowAsync(value);
-        }
-    }
-
     partial void OnEditorStatusChanged(string value)
     {
         var cleaned = UiText.Clean(value);
@@ -919,6 +1349,37 @@ public sealed partial class LibraryViewModel(
         {
             EditorStatus = cleaned;
         }
+    }
+
+    public void RefreshReferenceLists()
+    {
+        var selectedBlankTypeValue = SelectedBlankType.Value;
+        var selectedBlankTypeFilterValue = SelectedBlankTypeFilter.Value;
+        var selectedUnitValue = SelectedUnit.Value;
+        var selectedUnitFilterValue = SelectedUnitFilter.Value;
+
+        UiReferenceData.ReplaceOptions(BlankTypes, UiReferenceData.BlankTypes());
+        UiReferenceData.ReplaceOptions(UnitTypes, UiReferenceData.ConsumptionUnitTypes());
+        UiReferenceData.ReplaceOptions(BlankTypeFilters, UiReferenceData.BlankTypeFilters(includeUnknown: false));
+        UiReferenceData.ReplaceOptions(UnitFilters, UiReferenceData.ConsumptionUnitFilters());
+
+        SelectedBlankType = BlankTypes.FirstOrDefault(x => x.Value == selectedBlankTypeValue) ?? BlankTypes.First();
+        SelectedBlankTypeFilter = BlankTypeFilters.FirstOrDefault(x => x.Value == selectedBlankTypeFilterValue) ?? BlankTypeFilters.First();
+        SelectedUnit = UnitTypes.FirstOrDefault(x => x.Value == selectedUnitValue) ?? UnitTypes.First();
+        SelectedUnitFilter = UnitFilters.FirstOrDefault(x => x.Value == selectedUnitFilterValue) ?? UnitFilters.First();
+
+        OnPropertyChanged(nameof(NitridingServiceLabel));
+        OnPropertyChanged(nameof(HeatTreatmentServiceLabel));
+        OnPropertyChanged(nameof(ChemicalOxidationServiceLabel));
+        OnPropertyChanged(nameof(KeywayServiceLabel));
+        OnPropertyChanged(nameof(IsNitridingServiceVisible));
+        OnPropertyChanged(nameof(IsHeatTreatmentServiceVisible));
+        OnPropertyChanged(nameof(IsChemicalOxidationServiceVisible));
+        OnPropertyChanged(nameof(IsKeywayServiceVisible));
+        OnPropertyChanged(nameof(BlankSupplyHeatTreatmentLabel));
+        OnPropertyChanged(nameof(BlankSupplyLaserCuttingLabel));
+        OnPropertyChanged(nameof(IsBlankSupplyHeatTreatmentVisible));
+        OnPropertyChanged(nameof(IsBlankSupplyLaserCuttingVisible));
     }
 
     partial void OnSelectedBlankChanged(LibraryBlankOption? value)
@@ -930,7 +1391,7 @@ public sealed partial class LibraryViewModel(
             BlankSearch = value.DisplayName;
             suppressBlankSearchReload = false;
             var unit = IsMeterBasedBlankType(value.BlankType) ? MeasurementUnit.Meter : value.BaseUnit;
-            SelectedUnit = UnitTypes.FirstOrDefault(x => x.Value == unit) ?? SelectedUnit;
+            SelectedUnit = GetConsumptionUnitOption(unit);
         }
     }
 
@@ -947,11 +1408,873 @@ public sealed partial class LibraryViewModel(
         ConsumptionQuantity = 1m;
         ConsumptionQuantityText = "1";
         BlankLeadTimeDaysText = "30";
+        EditRequiresNitriding = false;
+        EditRequiresHeatTreatment = false;
+        EditRequiresChemicalOxidation = false;
+        EditRequiresKeyway = false;
+        EditBlankSupplyRequiresHeatTreatment = false;
+        EditBlankSupplyRequiresLaserCutting = false;
         SelectedUnit = UnitTypes[0];
         EditSource = "Ручной ввод";
         SelectedRow = null;
         EditorStatus = "Заполните поля и нажмите \"Сохранить\", чтобы добавить строку библиотеки вручную.";
     }
+
+    [RelayCommand]
+    private async Task OpenDrawingAsync(object? parameter)
+    {
+        var row = parameter as LibraryRow ?? SelectedRow;
+        if (row is null)
+        {
+            EditorStatus = "Выберите строку библиотеки для открытия чертежа.";
+            return;
+        }
+
+        SelectedRow = row;
+        EditorStatus = await DrawingPdfOpener.OpenExternalAsync(
+            new DrawingLookupRequest(row.Ips, row.Designation, row.PartName, null),
+            drawingService,
+            "Библиотека",
+            logger,
+            CancellationToken.None);
+    }
+
+    [RelayCommand]
+    private async Task OpenObjectCardAsync(object? parameter)
+    {
+        var row = parameter as LibraryRow ?? SelectedRow;
+        if (row is null)
+        {
+            EditorStatus = "Выберите строку библиотеки для открытия карточки объекта.";
+            return;
+        }
+
+        SelectedRow = row;
+        var routeRows = new ObservableCollection<ObjectCardRouteRow>(await LoadObjectCardRouteRowsAsync(row.Ips));
+        var toolRows = new ObservableCollection<ObjectCardToolRow>(await LoadObjectCardToolRowsAsync(row.Ips, routeRows));
+        var blankOptions = new ObservableCollection<LibraryBlankOption>(await LoadLibraryBlankOptionsForCardAsync(row.CanonicalBlankId, row.BlankType));
+        PdfViewer? viewer = null;
+        PdfDocument? document = null;
+        WindowsFormsHost? host = null;
+        FileInfo? currentDrawing = null;
+        var status = new TextBlock
+        {
+            Text = "Поиск PDF-чертежа...",
+            Foreground = Brushes.DimGray,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 8, 0, 0)
+        };
+
+        var ipsBox = new TextBox { Width = 140, Text = row.Ips, Margin = new Thickness(0, 0, 10, 8) };
+        var designationBox = new TextBox { Width = 180, Text = row.Designation ?? string.Empty, Margin = new Thickness(0, 0, 10, 8) };
+        var nameBox = new TextBox { Width = 260, Text = row.PartName, Margin = new Thickness(0, 0, 10, 8) };
+        var blankTypeBox = new ComboBox { Width = 180, ItemsSource = BlankTypes, DisplayMemberPath = nameof(DisplayOption<BlankType>.DisplayName), Margin = new Thickness(0, 0, 10, 8) };
+        blankTypeBox.SelectedItem = row.CanonicalBlankId is null
+            ? BlankTypes.FirstOrDefault()
+            : BlankTypes.FirstOrDefault(x => string.Equals(x.DisplayName, row.BlankType, StringComparison.OrdinalIgnoreCase)) ?? BlankTypes.FirstOrDefault();
+        var blankBox = new ComboBox
+        {
+            Width = 430,
+            IsEditable = true,
+            IsTextSearchEnabled = false,
+            StaysOpenOnEdit = true,
+            ItemsSource = blankOptions,
+            DisplayMemberPath = nameof(LibraryBlankOption.DisplayName),
+            Margin = new Thickness(0, 0, 10, 8)
+        };
+        blankBox.SelectedItem = row.CanonicalBlankId is null ? null : blankOptions.FirstOrDefault(x => x.Id == row.CanonicalBlankId.Value);
+        blankBox.Text = row.BlankName ?? string.Empty;
+        var codeBox = new TextBox { Width = 120, Text = row.OneCCode ?? string.Empty, IsReadOnly = true, Margin = new Thickness(0, 0, 10, 8) };
+        var quantityBox = new TextBox { Width = 110, Text = row.Quantity, Margin = new Thickness(0, 0, 10, 8) };
+        var unitBox = new ComboBox { Width = 130, ItemsSource = UnitTypes, DisplayMemberPath = nameof(DisplayOption<MeasurementUnit>.DisplayName), Margin = new Thickness(0, 0, 10, 8) };
+        unitBox.SelectedItem = UnitTypes.FirstOrDefault(x => x.Value == row.ConsumptionUnit) ?? UnitTypes.FirstOrDefault();
+        var leadTimeBox = new TextBox { Width = 110, Text = row.BlankLeadTimeDaysText, Margin = new Thickness(0, 0, 10, 8) };
+        var nitridingBox = new System.Windows.Controls.CheckBox { Content = NitridingServiceLabel, IsChecked = row.RequiresNitriding, Visibility = IsNitridingServiceVisible ? Visibility.Visible : Visibility.Collapsed, Margin = new Thickness(0, 0, 14, 8) };
+        var heatTreatmentBox = new System.Windows.Controls.CheckBox { Content = HeatTreatmentServiceLabel, IsChecked = row.RequiresHeatTreatment, Visibility = IsHeatTreatmentServiceVisible ? Visibility.Visible : Visibility.Collapsed, Margin = new Thickness(0, 0, 14, 8) };
+        var chemicalOxBox = new System.Windows.Controls.CheckBox { Content = ChemicalOxidationServiceLabel, IsChecked = row.RequiresChemicalOxidation, Visibility = IsChemicalOxidationServiceVisible ? Visibility.Visible : Visibility.Collapsed, Margin = new Thickness(0, 0, 14, 8) };
+        var keywayBox = new System.Windows.Controls.CheckBox { Content = KeywayServiceLabel, IsChecked = row.RequiresKeyway, Visibility = IsKeywayServiceVisible ? Visibility.Visible : Visibility.Collapsed, Margin = new Thickness(0, 0, 14, 8) };
+        var blankSupplyHeatBox = new System.Windows.Controls.CheckBox { Content = BlankSupplyHeatTreatmentLabel, IsChecked = row.BlankSupplyRequiresHeatTreatment, Visibility = IsBlankSupplyHeatTreatmentVisible ? Visibility.Visible : Visibility.Collapsed, Margin = new Thickness(0, 0, 14, 8) };
+        var blankSupplyLaserBox = new System.Windows.Controls.CheckBox { Content = BlankSupplyLaserCuttingLabel, IsChecked = row.BlankSupplyRequiresLaserCutting, Visibility = IsBlankSupplyLaserCuttingVisible ? Visibility.Visible : Visibility.Collapsed, Margin = new Thickness(0, 0, 14, 8) };
+        var laborText = new TextBlock { Text = BuildObjectCardLaborText(routeRows), FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 8, 0, 8) };
+        var cardStatus = new TextBlock { Foreground = Brushes.DimGray, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
+
+        blankBox.SelectionChanged += (_, _) =>
+        {
+            if (blankBox.SelectedItem is LibraryBlankOption option)
+            {
+                blankBox.Text = option.DisplayName;
+                codeBox.Text = option.OneCCode ?? string.Empty;
+                unitBox.SelectedItem = UnitTypes.FirstOrDefault(x => x.Value == (IsMeterBasedBlankType(option.BlankType) ? MeasurementUnit.Meter : option.BaseUnit)) ?? unitBox.SelectedItem;
+            }
+        };
+        blankTypeBox.SelectionChanged += async (_, _) =>
+        {
+            if (blankTypeBox.SelectedItem is not DisplayOption<BlankType> type)
+            {
+                return;
+            }
+
+            blankOptions.Clear();
+            foreach (var option in await LoadLibraryBlankOptionsForCardAsync(null, type.DisplayName))
+            {
+                blankOptions.Add(option);
+            }
+        };
+
+        var infoPanel = new DockPanel { Margin = new Thickness(10) };
+        var infoButtons = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
+        DockPanel.SetDock(infoButtons, Dock.Bottom);
+        infoPanel.Children.Add(infoButtons);
+        var infoContent = new StackPanel();
+        infoPanel.Children.Add(infoContent);
+        infoContent.Children.Add(new TextBlock { Text = "Информация по детали", FontSize = 18, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 8) });
+        var infoLine1 = new WrapPanel();
+        infoLine1.Children.Add(LabeledControl("IPS", ipsBox));
+        infoLine1.Children.Add(LabeledControl("Обозначение", designationBox));
+        infoLine1.Children.Add(LabeledControl("Наименование", nameBox));
+        infoContent.Children.Add(infoLine1);
+        var infoLine2 = new WrapPanel();
+        infoLine2.Children.Add(LabeledControl("Вид заготовки", blankTypeBox));
+        infoLine2.Children.Add(LabeledControl("Заготовка", blankBox));
+        infoLine2.Children.Add(LabeledControl("Код УТ", codeBox));
+        infoContent.Children.Add(infoLine2);
+        var infoLine3 = new WrapPanel();
+        infoLine3.Children.Add(LabeledControl("Норма", quantityBox));
+        infoLine3.Children.Add(LabeledControl("Ед. измерения", unitBox));
+        infoLine3.Children.Add(LabeledControl("Срок, дней", leadTimeBox));
+        infoContent.Children.Add(infoLine3);
+        var servicesLine = new WrapPanel();
+        servicesLine.Children.Add(new TextBlock { Text = "Услуги:", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 8) });
+        servicesLine.Children.Add(nitridingBox);
+        servicesLine.Children.Add(heatTreatmentBox);
+        servicesLine.Children.Add(chemicalOxBox);
+        servicesLine.Children.Add(keywayBox);
+        infoContent.Children.Add(servicesLine);
+        var supplyLine = new WrapPanel();
+        supplyLine.Children.Add(new TextBlock { Text = "Условие поставки заготовки:", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 8) });
+        supplyLine.Children.Add(blankSupplyHeatBox);
+        supplyLine.Children.Add(blankSupplyLaserBox);
+        infoContent.Children.Add(supplyLine);
+        infoContent.Children.Add(laborText);
+        infoContent.Children.Add(cardStatus);
+
+        var saveInfoButton = new Button { Content = "Сохранить информацию" };
+        infoButtons.Children.Add(saveInfoButton);
+
+        var routeGrid = new DataGrid
+        {
+            ItemsSource = routeRows,
+            AutoGenerateColumns = false,
+            CanUserAddRows = false,
+            CanUserDeleteRows = true,
+            IsReadOnly = false,
+            SelectionUnit = DataGridSelectionUnit.CellOrRowHeader,
+            SelectionMode = DataGridSelectionMode.Extended,
+            ClipboardCopyMode = DataGridClipboardCopyMode.ExcludeHeader
+        };
+        routeGrid.Columns.Add(new DataGridTextColumn { Header = "№ операции", Binding = new Binding(nameof(ObjectCardRouteRow.OperationNumber)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = 95 });
+        routeGrid.Columns.Add(new DataGridTextColumn { Header = "Наименование", Binding = new Binding(nameof(ObjectCardRouteRow.OperationName)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
+        routeGrid.Columns.Add(new DataGridTextColumn { Header = "Рабочий центр", Binding = new Binding(nameof(ObjectCardRouteRow.WorkCenter)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = 150 });
+        routeGrid.Columns.Add(new DataGridTextColumn { Header = "Т маш", Binding = new Binding(nameof(ObjectCardRouteRow.MachineTimeText)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = 80 });
+        routeGrid.Columns.Add(new DataGridTextColumn { Header = "Тнал", Binding = new Binding(nameof(ObjectCardRouteRow.SetupTimeText)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = 80 });
+        routeGrid.Columns.Add(new DataGridTextColumn { Header = "Твсп", Binding = new Binding(nameof(ObjectCardRouteRow.AuxiliaryTimeText)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = 80 });
+        var routePanel = new DockPanel { Margin = new Thickness(10) };
+        var routeButtons = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
+        DockPanel.SetDock(routeButtons, Dock.Bottom);
+        routePanel.Children.Add(routeButtons);
+        routePanel.Children.Add(routeGrid);
+        var addRouteButton = new Button { Content = "Добавить операцию" };
+        var deleteRouteButton = new Button { Content = "Удалить" };
+        var upRouteButton = new Button { Content = "Выше" };
+        var downRouteButton = new Button { Content = "Ниже" };
+        var saveRouteButton = new Button { Content = "Сохранить маршрут обработки" };
+        routeButtons.Children.Add(addRouteButton);
+        routeButtons.Children.Add(deleteRouteButton);
+        routeButtons.Children.Add(upRouteButton);
+        routeButtons.Children.Add(downRouteButton);
+        routeButtons.Children.Add(saveRouteButton);
+
+        var toolGrid = new DataGrid
+        {
+            ItemsSource = toolRows,
+            AutoGenerateColumns = false,
+            CanUserAddRows = false,
+            CanUserDeleteRows = true,
+            IsReadOnly = false,
+            SelectionUnit = DataGridSelectionUnit.CellOrRowHeader,
+            SelectionMode = DataGridSelectionMode.Extended,
+            ClipboardCopyMode = DataGridClipboardCopyMode.ExcludeHeader
+        };
+        toolGrid.Columns.Add(new DataGridTextColumn { Header = "№ операции", Binding = new Binding(nameof(ObjectCardToolRow.OperationNumber)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = 95 });
+        toolGrid.Columns.Add(new DataGridTextColumn { Header = "Операция", Binding = new Binding(nameof(ObjectCardToolRow.OperationName)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = 170 });
+        toolGrid.Columns.Add(new DataGridTextColumn { Header = "Инструмент/оснастка", Binding = new Binding(nameof(ObjectCardToolRow.ToolingName)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
+        toolGrid.Columns.Add(new DataGridTextColumn { Header = "Норма расхода", Binding = new Binding(nameof(ObjectCardToolRow.ConsumptionRate)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = 130 });
+        var toolPanel = new DockPanel { Margin = new Thickness(10) };
+        var toolButtons = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
+        DockPanel.SetDock(toolButtons, Dock.Bottom);
+        toolPanel.Children.Add(toolButtons);
+        toolPanel.Children.Add(toolGrid);
+        var addToolButton = new Button { Content = "Добавить строку" };
+        var deleteToolButton = new Button { Content = "Удалить" };
+        var syncToolsButton = new Button { Content = "Обновить операции" };
+        var saveToolsButton = new Button { Content = "Сохранить СТО и расход" };
+        toolButtons.Children.Add(addToolButton);
+        toolButtons.Children.Add(deleteToolButton);
+        toolButtons.Children.Add(syncToolsButton);
+        toolButtons.Children.Add(saveToolsButton);
+
+        var tabs = new System.Windows.Controls.TabControl();
+        tabs.Items.Add(new TabItem { Header = "Информация по детали", Content = infoPanel });
+        tabs.Items.Add(new TabItem { Header = "Маршрут обработки и трудоемкость", Content = routePanel });
+        tabs.Items.Add(new TabItem { Header = "СТО и расход", Content = toolPanel });
+
+        var left = new DockPanel
+        {
+            LastChildFill = true
+        };
+        left.Children.Add(new TextBlock { Text = "Карточка объекта", FontSize = 22, FontWeight = FontWeights.SemiBold, Margin = new Thickness(12, 12, 12, 6) });
+        DockPanel.SetDock(left.Children[0], Dock.Top);
+        left.Children.Add(tabs);
+
+        try
+        {
+            viewer = new PdfViewer
+            {
+                Dock = System.Windows.Forms.DockStyle.Fill,
+                ZoomMode = PdfViewerZoomMode.FitWidth
+            };
+            host = new WindowsFormsHost { Child = viewer };
+        }
+        catch (Exception ex)
+        {
+            status.Text = $"PDF-viewer не запущен: {ex.GetBaseException().Message}";
+        }
+
+        var layout = new Grid();
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.52, GridUnitType.Star), MinWidth = 520 });
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.48, GridUnitType.Star), MinWidth = 420 });
+        layout.Children.Add(left);
+        var fullScreenButton = new Button { Content = "Открыть на все окно", HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 0, 8, 8) };
+        var rightPanel = new DockPanel { Margin = new Thickness(10) };
+        var rightTop = new DockPanel();
+        DockPanel.SetDock(rightTop, Dock.Top);
+        rightTop.Children.Add(fullScreenButton);
+        rightTop.Children.Add(status);
+        rightPanel.Children.Add(rightTop);
+        rightPanel.Children.Add(host is not null ? host : new TextBlock { Text = status.Text, Margin = new Thickness(16), TextWrapping = TextWrapping.Wrap });
+        var right = new Border
+        {
+            BorderBrush = Brushes.LightGray,
+            BorderThickness = new Thickness(1, 0, 0, 0),
+            Child = rightPanel
+        };
+        Grid.SetColumn(right, 1);
+        layout.Children.Add(right);
+
+        var window = new Window
+        {
+            Title = $"Карточка объекта IPS {row.Ips}",
+            Owner = Application.Current?.MainWindow,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Width = 1180,
+            Height = 760,
+            MinWidth = 920,
+            MinHeight = 620,
+            Content = layout
+        };
+        saveInfoButton.Click += async (_, _) =>
+        {
+            await SaveObjectCardInfoAsync(
+                row,
+                ipsBox.Text,
+                designationBox.Text,
+                nameBox.Text,
+                blankTypeBox.SelectedItem as DisplayOption<BlankType>,
+                blankBox.SelectedItem as LibraryBlankOption,
+                blankBox.Text,
+                quantityBox.Text,
+                unitBox.SelectedItem as DisplayOption<MeasurementUnit>,
+                leadTimeBox.Text,
+                nitridingBox.IsChecked.GetValueOrDefault(),
+                heatTreatmentBox.IsChecked.GetValueOrDefault(),
+                chemicalOxBox.IsChecked.GetValueOrDefault(),
+                keywayBox.IsChecked.GetValueOrDefault(),
+                blankSupplyHeatBox.IsChecked.GetValueOrDefault(),
+                blankSupplyLaserBox.IsChecked.GetValueOrDefault(),
+                cardStatus);
+        };
+        addRouteButton.Click += (_, _) =>
+        {
+            routeGrid.CommitEdit(DataGridEditingUnit.Row, true);
+            var next = routeRows.Count == 0 ? 10 : routeRows.Select(x => x.SequenceValue).DefaultIfEmpty(0).Max() + 10;
+            routeRows.Add(new ObjectCardRouteRow(next.ToString(CultureInfo.InvariantCulture), string.Empty, string.Empty, string.Empty, string.Empty, string.Empty));
+            laborText.Text = BuildObjectCardLaborText(routeRows);
+            SyncToolRowsWithRoute(toolRows, routeRows);
+        };
+        deleteRouteButton.Click += (_, _) =>
+        {
+            routeGrid.CommitEdit(DataGridEditingUnit.Row, true);
+            RemoveSelectedRows(routeGrid, routeRows);
+            laborText.Text = BuildObjectCardLaborText(routeRows);
+            SyncToolRowsWithRoute(toolRows, routeRows);
+        };
+        upRouteButton.Click += (_, _) =>
+        {
+            routeGrid.CommitEdit(DataGridEditingUnit.Row, true);
+            MoveSelectedRow(routeGrid, routeRows, -1);
+            RenumberRouteRows(routeRows);
+            laborText.Text = BuildObjectCardLaborText(routeRows);
+            SyncToolRowsWithRoute(toolRows, routeRows);
+        };
+        downRouteButton.Click += (_, _) =>
+        {
+            routeGrid.CommitEdit(DataGridEditingUnit.Row, true);
+            MoveSelectedRow(routeGrid, routeRows, 1);
+            RenumberRouteRows(routeRows);
+            laborText.Text = BuildObjectCardLaborText(routeRows);
+            SyncToolRowsWithRoute(toolRows, routeRows);
+        };
+        saveRouteButton.Click += async (_, _) =>
+        {
+            routeGrid.CommitEdit(DataGridEditingUnit.Row, true);
+            await SaveObjectCardRouteRowsAsync(ipsBox.Text, routeRows, cardStatus);
+            laborText.Text = BuildObjectCardLaborText(routeRows);
+            SyncToolRowsWithRoute(toolRows, routeRows);
+        };
+        addToolButton.Click += (_, _) =>
+        {
+            toolGrid.CommitEdit(DataGridEditingUnit.Row, true);
+            var route = routeRows.FirstOrDefault();
+            toolRows.Add(new ObjectCardToolRow(route?.OperationNumber ?? string.Empty, route?.OperationName ?? string.Empty, string.Empty, string.Empty));
+        };
+        deleteToolButton.Click += (_, _) =>
+        {
+            toolGrid.CommitEdit(DataGridEditingUnit.Row, true);
+            RemoveSelectedRows(toolGrid, toolRows);
+        };
+        syncToolsButton.Click += (_, _) =>
+        {
+            routeGrid.CommitEdit(DataGridEditingUnit.Row, true);
+            SyncToolRowsWithRoute(toolRows, routeRows);
+        };
+        saveToolsButton.Click += async (_, _) =>
+        {
+            toolGrid.CommitEdit(DataGridEditingUnit.Row, true);
+            await SaveObjectCardToolRowsAsync(ipsBox.Text, toolRows, cardStatus);
+        };
+        fullScreenButton.Click += (_, _) =>
+        {
+            if (currentDrawing is null)
+            {
+                status.Foreground = Brushes.Firebrick;
+                status.Text = "PDF-чертеж еще не открыт.";
+                return;
+            }
+
+            ShowPdfFullScreen(currentDrawing, row);
+        };
+        window.Closed += (_, _) =>
+        {
+            if (viewer is not null)
+            {
+                viewer.Document = null;
+            }
+
+            if (host is not null)
+            {
+                host.Child = null;
+            }
+
+            viewer?.Dispose();
+            document?.Dispose();
+        };
+        window.Show();
+
+        if (viewer is null)
+        {
+            return;
+        }
+
+        currentDrawing = await DrawingPdfOpener.ResolveDrawingPdfAsync(
+            new DrawingLookupRequest(row.Ips, row.Designation, row.PartName, null),
+            drawingService,
+            logger,
+            CancellationToken.None);
+        if (currentDrawing is null)
+        {
+            status.Foreground = Brushes.Firebrick;
+            status.Text = $"PDF-чертеж IPS {row.Ips} не найден.";
+            return;
+        }
+
+        try
+        {
+            document = PdfDocument.Load(currentDrawing.FullName);
+            viewer.Document = document;
+            viewer.ZoomMode = PdfViewerZoomMode.FitWidth;
+            status.Foreground = Brushes.SeaGreen;
+            status.Text = $"PDF-чертеж открыт: {currentDrawing.Name}";
+        }
+        catch (Exception ex)
+        {
+            document?.Dispose();
+            document = null;
+            status.Foreground = Brushes.Firebrick;
+            status.Text = $"PDF найден, но viewer не смог открыть файл: {ex.GetBaseException().Message}";
+        }
+    }
+
+    private async Task<IReadOnlyList<LibraryBlankOption>> LoadLibraryBlankOptionsForCardAsync(long? selectedBlankId, string? blankTypeName)
+    {
+        var selectedType = BlankTypes.FirstOrDefault(x => string.Equals(x.DisplayName, blankTypeName, StringComparison.OrdinalIgnoreCase))?.Value;
+        var query = dbContext.CanonicalBlanks.AsNoTracking()
+            .Include(x => x.Aliases)
+            .Where(x => x.IsActive);
+        if (selectedType is not null && selectedType != BlankType.Unknown)
+        {
+            query = query.Where(x => x.BlankType == selectedType);
+        }
+
+        var options = await query
+            .OrderBy(x => x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault() ?? x.CanonicalName)
+            .Take(5000)
+            .Select(x => new LibraryBlankOption(
+                x.Id,
+                x.BlankType,
+                x.CanonicalName,
+                x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault(),
+                x.Material,
+                x.BaseUnit,
+                x.Aliases.Where(a => a.IsActive).Select(a => a.OneCCode).FirstOrDefault()))
+            .ToListAsync();
+
+        if (selectedBlankId is not null && options.All(x => x.Id != selectedBlankId.Value))
+        {
+            var selected = await dbContext.CanonicalBlanks.AsNoTracking()
+                .Where(x => x.Id == selectedBlankId.Value)
+                .Select(x => new LibraryBlankOption(
+                    x.Id,
+                    x.BlankType,
+                    x.CanonicalName,
+                    x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault(),
+                    x.Material,
+                    x.BaseUnit,
+                    x.Aliases.Where(a => a.IsActive).Select(a => a.OneCCode).FirstOrDefault()))
+                .FirstOrDefaultAsync();
+            if (selected is not null)
+            {
+                options.Insert(0, selected);
+            }
+        }
+
+        return options;
+    }
+
+    private async Task<LibraryBlankOption?> ResolveBlankOptionForCardAsync(string? text, BlankType? selectedType)
+    {
+        var searchText = text?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(searchText))
+        {
+            return null;
+        }
+
+        var query = dbContext.CanonicalBlanks.AsNoTracking()
+            .Include(x => x.Aliases)
+            .Where(x => x.IsActive);
+        if (selectedType is not null && selectedType != BlankType.Unknown)
+        {
+            query = query.Where(x => x.BlankType == selectedType.Value);
+        }
+
+        var blanks = await query.Take(5000).ToListAsync();
+        return blanks
+            .Where(x => BlankMatchesSearch(x, searchText))
+            .OrderBy(x => x.Aliases.Any(a => UiSearchText.EqualsNormalized(a.OneCCode, searchText)) ? 0 : 1)
+            .ThenBy(x => x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault() ?? x.CanonicalName)
+            .Select(x => new LibraryBlankOption(
+                x.Id,
+                x.BlankType,
+                x.CanonicalName,
+                x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault(),
+                x.Material,
+                x.BaseUnit,
+                x.Aliases.Where(a => a.IsActive).Select(a => a.OneCCode).FirstOrDefault()))
+            .FirstOrDefault();
+    }
+
+    private async Task SaveObjectCardInfoAsync(
+        LibraryRow sourceRow,
+        string ips,
+        string designation,
+        string name,
+        DisplayOption<BlankType>? blankType,
+        LibraryBlankOption? selectedBlank,
+        string blankText,
+        string quantityText,
+        DisplayOption<MeasurementUnit>? unit,
+        string leadTimeText,
+        bool requiresNitriding,
+        bool requiresHeatTreatment,
+        bool requiresChemicalOxidation,
+        bool requiresKeyway,
+        bool supplyRequiresHeatTreatment,
+        bool supplyRequiresLaserCutting,
+        TextBlock status)
+    {
+        ips = ips.Trim();
+        if (string.IsNullOrWhiteSpace(ips))
+        {
+            status.Foreground = Brushes.Firebrick;
+            status.Text = "Укажите IPS.";
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            status.Foreground = Brushes.Firebrick;
+            status.Text = "Укажите наименование детали.";
+            return;
+        }
+
+        var duplicatePart = await dbContext.Parts.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Ips == ips && x.Id != sourceRow.PartId);
+        if (duplicatePart is not null)
+        {
+            status.Foreground = Brushes.Firebrick;
+            status.Text = $"IPS {ips} уже есть в библиотеке у другой карточки.";
+            return;
+        }
+
+        var part = await dbContext.Parts
+            .Include(x => x.BlankMaps.Where(m => m.IsActive))
+            .FirstOrDefaultAsync(x => x.Id == sourceRow.PartId);
+        if (part is null)
+        {
+            status.Foreground = Brushes.Firebrick;
+            status.Text = "Деталь не найдена в библиотеке.";
+            return;
+        }
+
+        part.Ips = ips;
+        part.Designation = NullIfWhiteSpace(designation);
+        part.Name = name.Trim();
+        part.RequiresNitriding = requiresNitriding;
+        part.RequiresHeatTreatment = requiresHeatTreatment;
+        part.RequiresChemicalOxidation = requiresChemicalOxidation;
+        part.RequiresKeyway = requiresKeyway;
+        part.BlankSupplyRequiresHeatTreatment = supplyRequiresHeatTreatment;
+        part.BlankSupplyRequiresLaserCutting = supplyRequiresLaserCutting;
+        part.UpdatedAt = DateTime.UtcNow;
+
+        var blank = selectedBlank ?? await ResolveBlankOptionForCardAsync(blankText, blankType?.Value);
+        if (blank is not null)
+        {
+            if (!TryParseQuantity(quantityText, out var quantity) || quantity <= 0)
+            {
+                status.Foreground = Brushes.Firebrick;
+                status.Text = "Норма расхода должна быть положительным числом.";
+                return;
+            }
+
+            if (!int.TryParse(leadTimeText.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var leadTimeDays) || leadTimeDays < 0)
+            {
+                status.Foreground = Brushes.Firebrick;
+                status.Text = "Срок заготовки должен быть целым числом дней.";
+                return;
+            }
+
+            var selectedUnit = unit ?? UnitTypes.FirstOrDefault();
+            if (selectedUnit is null)
+            {
+                status.Foreground = Brushes.Firebrick;
+                status.Text = "Укажите единицу измерения.";
+                return;
+            }
+
+            var storedQuantity = ToStoredConsumptionQuantity(quantity, selectedUnit);
+            var sameMap = part.BlankMaps.FirstOrDefault(x => x.CanonicalBlankId == blank.Id && x.IsActive);
+            foreach (var activeMap in part.BlankMaps.Where(x => x.IsActive && (sameMap is null || x.Id != sameMap.Id)))
+            {
+                activeMap.IsActive = false;
+                activeMap.IsPrimary = false;
+                activeMap.UpdatedAt = DateTime.UtcNow;
+            }
+
+            if (sameMap is null)
+            {
+                dbContext.PartBlankMaps.Add(new PartBlankMap
+                {
+                    Part = part,
+                    CanonicalBlankId = blank.Id,
+                    ConsumptionQuantity = storedQuantity,
+                    ConsumptionUnit = selectedUnit.Value,
+                    BlankLeadTimeDays = leadTimeDays,
+                    Source = "Карточка объекта",
+                    IsPrimary = true,
+                    IsActive = true
+                });
+            }
+            else
+            {
+                sameMap.ConsumptionQuantity = storedQuantity;
+                sameMap.ConsumptionUnit = selectedUnit.Value;
+                sameMap.BlankLeadTimeDays = leadTimeDays;
+                sameMap.Source = string.IsNullOrWhiteSpace(sameMap.Source) ? "Карточка объекта" : sameMap.Source;
+                sameMap.IsPrimary = true;
+                sameMap.UpdatedAt = DateTime.UtcNow;
+            }
+        }
+
+        await dbContext.SaveChangesAsync();
+        await LoadAsync();
+        status.Foreground = Brushes.SeaGreen;
+        status.Text = $"Информация по детали IPS {ips} сохранена и синхронизирована с библиотекой.";
+    }
+
+    private async Task<IReadOnlyList<ObjectCardRouteRow>> LoadObjectCardRouteRowsAsync(string ips)
+    {
+        var rows = await dbContext.ProductionRouteOperations.AsNoTracking()
+            .Where(x => x.Ips == ips)
+            .OrderBy(x => x.Sequence)
+            .ToListAsync();
+        return rows
+            .Select(x => new ObjectCardRouteRow(
+                string.IsNullOrWhiteSpace(x.OperationCode) ? x.Sequence.ToString(CultureInfo.InvariantCulture) : x.OperationCode,
+                UiText.Clean(x.Description),
+                UiText.Clean(x.EquipmentGroup),
+                FormatDecimal(x.MachineMinutes),
+                FormatDecimal(x.SetupMinutes),
+                FormatDecimal(x.AuxiliaryMinutes)))
+            .ToList();
+    }
+
+    private async Task SaveObjectCardRouteRowsAsync(string ips, ObservableCollection<ObjectCardRouteRow> rows, TextBlock status)
+    {
+        ips = ips.Trim();
+        if (string.IsNullOrWhiteSpace(ips))
+        {
+            status.Foreground = Brushes.Firebrick;
+            status.Text = "Укажите IPS перед сохранением маршрута.";
+            return;
+        }
+
+        var existing = await dbContext.ProductionRouteOperations.Where(x => x.Ips == ips).ToListAsync();
+        dbContext.ProductionRouteOperations.RemoveRange(existing);
+        var usedSequences = new HashSet<int>();
+        var index = 0;
+        foreach (var row in rows.Where(x => !x.IsEmpty))
+        {
+            index++;
+            var sequence = row.SequenceValue;
+            if (sequence <= 0 || !usedSequences.Add(sequence))
+            {
+                sequence = index * 10;
+                while (!usedSequences.Add(sequence))
+                {
+                    sequence += 10;
+                }
+            }
+
+            dbContext.ProductionRouteOperations.Add(new ProductionRouteOperation
+            {
+                Ips = ips,
+                Sequence = sequence,
+                OperationCode = row.OperationNumber.Trim(),
+                Description = row.OperationName.Trim(),
+                EquipmentGroup = row.WorkCenter.Trim(),
+                MachineMinutes = ParseOptionalDecimal(row.MachineTimeText),
+                PieceMinutes = ParseOptionalDecimal(row.MachineTimeText),
+                SetupMinutes = ParseOptionalDecimal(row.SetupTimeText),
+                AuxiliaryMinutes = ParseOptionalDecimal(row.AuxiliaryTimeText),
+                UpdatedAt = DateTime.UtcNow
+            });
+        }
+
+        await dbContext.SaveChangesAsync();
+        status.Foreground = Brushes.SeaGreen;
+        status.Text = $"Маршрут обработки IPS {ips} сохранен. Операций: {rows.Count(x => !x.IsEmpty)}.";
+    }
+
+    private async Task<IReadOnlyList<ObjectCardToolRow>> LoadObjectCardToolRowsAsync(string ips, IReadOnlyList<ObjectCardRouteRow> routeRows)
+    {
+        var json = await dbContext.Settings.AsNoTracking()
+            .Where(x => x.Key == BuildObjectCardToolsSettingKey(ips))
+            .Select(x => x.Value)
+            .FirstOrDefaultAsync();
+        var rows = string.IsNullOrWhiteSpace(json)
+            ? []
+            : JsonSerializer.Deserialize<List<ObjectCardToolRowDto>>(json) ?? [];
+        var result = rows
+            .Select(x => new ObjectCardToolRow(x.OperationNumber, x.OperationName, x.ToolingName, x.ConsumptionRate))
+            .ToList();
+        if (result.Count == 0)
+        {
+            result.AddRange(routeRows.Select(x => new ObjectCardToolRow(x.OperationNumber, x.OperationName, string.Empty, string.Empty)));
+        }
+
+        return result;
+    }
+
+    private async Task SaveObjectCardToolRowsAsync(string ips, ObservableCollection<ObjectCardToolRow> rows, TextBlock status)
+    {
+        ips = ips.Trim();
+        if (string.IsNullOrWhiteSpace(ips))
+        {
+            status.Foreground = Brushes.Firebrick;
+            status.Text = "Укажите IPS перед сохранением СТО и расхода.";
+            return;
+        }
+
+        var dto = rows
+            .Where(x => !x.IsEmpty)
+            .Select(x => new ObjectCardToolRowDto(x.OperationNumber.Trim(), x.OperationName.Trim(), x.ToolingName.Trim(), x.ConsumptionRate.Trim()))
+            .ToList();
+        var json = JsonSerializer.Serialize(dto);
+        var key = BuildObjectCardToolsSettingKey(ips);
+        var setting = await dbContext.Settings.FirstOrDefaultAsync(x => x.Key == key);
+        if (setting is null)
+        {
+            dbContext.Settings.Add(new AppSetting { Key = key, Value = json });
+        }
+        else
+        {
+            setting.Value = json;
+        }
+
+        await dbContext.SaveChangesAsync();
+        status.Foreground = Brushes.SeaGreen;
+        status.Text = $"СТО и расход IPS {ips} сохранены. Строк: {dto.Count}.";
+    }
+
+    private static void SyncToolRowsWithRoute(ObservableCollection<ObjectCardToolRow> toolRows, IEnumerable<ObjectCardRouteRow> routeRows)
+    {
+        foreach (var route in routeRows.Where(x => !x.IsEmpty))
+        {
+            if (toolRows.Any(x => string.Equals(x.OperationNumber, route.OperationNumber, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            toolRows.Add(new ObjectCardToolRow(route.OperationNumber, route.OperationName, string.Empty, string.Empty));
+        }
+    }
+
+    private static void RenumberRouteRows(ObservableCollection<ObjectCardRouteRow> rows)
+    {
+        for (var index = 0; index < rows.Count; index++)
+        {
+            if (rows[index].SequenceValue <= 0)
+            {
+                rows[index].OperationNumber = ((index + 1) * 10).ToString(CultureInfo.InvariantCulture);
+            }
+        }
+    }
+
+    private static string BuildObjectCardLaborText(IEnumerable<ObjectCardRouteRow> rows)
+    {
+        var routeRows = rows.Where(x => !x.IsEmpty).ToList();
+        var machine = routeRows.Sum(x => ParseOptionalDecimal(x.MachineTimeText));
+        var setup = routeRows.Sum(x => ParseOptionalDecimal(x.SetupTimeText));
+        var auxiliary = routeRows.Sum(x => ParseOptionalDecimal(x.AuxiliaryTimeText));
+        var total = machine + setup + auxiliary;
+        return $"Трудоемкость изготовления: Т маш {FormatDecimal(machine)} мин; Тнал {FormatDecimal(setup)} мин; Твсп {FormatDecimal(auxiliary)} мин; всего {FormatDecimal(total)} мин.";
+    }
+
+    private static StackPanel LabeledControl(string label, System.Windows.Controls.Control control) =>
+        new()
+        {
+            Children =
+            {
+                new TextBlock { Text = label },
+                control
+            }
+        };
+
+    private static void RemoveSelectedRows<T>(DataGrid grid, ObservableCollection<T> rows)
+    {
+        var selected = grid.SelectedItems.OfType<T>().ToList();
+        if (selected.Count == 0 && grid.CurrentItem is T current)
+        {
+            selected.Add(current);
+        }
+
+        foreach (var row in selected)
+        {
+            rows.Remove(row);
+        }
+    }
+
+    private static void MoveSelectedRow<T>(DataGrid grid, ObservableCollection<T> rows, int direction)
+    {
+        if (grid.CurrentItem is not T row)
+        {
+            return;
+        }
+
+        var index = rows.IndexOf(row);
+        var target = index + direction;
+        if (index < 0 || target < 0 || target >= rows.Count)
+        {
+            return;
+        }
+
+        rows.Move(index, target);
+        grid.SelectedItem = row;
+    }
+
+    private static void ShowPdfFullScreen(FileInfo drawing, LibraryRow row)
+    {
+        PdfViewer? fullViewer = null;
+        PdfDocument? fullDocument = null;
+        WindowsFormsHost? fullHost = null;
+        try
+        {
+            fullDocument = PdfDocument.Load(drawing.FullName);
+            fullViewer = new PdfViewer
+            {
+                Dock = System.Windows.Forms.DockStyle.Fill,
+                ZoomMode = PdfViewerZoomMode.FitWidth,
+                Document = fullDocument
+            };
+            fullHost = new WindowsFormsHost { Child = fullViewer };
+            var window = new Window
+            {
+                Title = $"Чертеж IPS {row.Ips}",
+                Owner = Application.Current?.MainWindow,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                WindowState = WindowState.Maximized,
+                Content = fullHost
+            };
+            window.Closed += (_, _) =>
+            {
+                if (fullViewer is not null)
+                {
+                    fullViewer.Document = null;
+                }
+
+                if (fullHost is not null)
+                {
+                    fullHost.Child = null;
+                }
+
+                fullViewer?.Dispose();
+                fullDocument?.Dispose();
+            };
+            window.Show();
+        }
+        catch (Exception ex)
+        {
+            fullViewer?.Dispose();
+            fullDocument?.Dispose();
+            MessageBox.Show($"Не удалось открыть чертеж на все окно.\n{ex.GetBaseException().Message}", "Карточка объекта", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private static string BuildObjectCardToolsSettingKey(string ips) =>
+        $"ObjectCard.Tools.{StockCodeNormalizer.NormalizeForComparison(ips)}";
+
+    private static decimal ParseOptionalDecimal(string? value) =>
+        TryParseQuantity(value, out var quantity) ? quantity : 0m;
 
     [RelayCommand]
     private async Task ImportLibraryAsync()
@@ -1021,18 +2344,7 @@ public sealed partial class LibraryViewModel(
         var query = dbContext.Parts.AsNoTracking()
             .Where(x => x.Source == null || !x.Source.Contains("[ARCHIVED_LIBRARY]"))
             .AsQueryable();
-        if (!string.IsNullOrWhiteSpace(Search))
-        {
-            var searchValue = Search.Trim();
-            query = query.Where(x =>
-                x.Ips.Contains(searchValue) ||
-                (x.Designation != null && x.Designation.Contains(searchValue)) ||
-                x.Name.Contains(searchValue) ||
-                x.BlankMaps.Any(m => m.IsActive && m.CanonicalBlank != null &&
-                    (m.CanonicalBlank.CanonicalName.Contains(searchValue) ||
-                     (m.CanonicalBlank.Material != null && m.CanonicalBlank.Material.Contains(searchValue)) ||
-                     m.CanonicalBlank.Aliases.Any(a => a.OneCCode.Contains(searchValue) || a.SourceName.Contains(searchValue)))));
-        }
+        var searchValue = Search.Trim();
 
         if (SelectedBlankTypeFilter.Value is not null)
         {
@@ -1055,14 +2367,46 @@ public sealed partial class LibraryViewModel(
                 : query.Where(x => !x.BlankMaps.Any(m => m.IsActive));
         }
 
+        HashSet<string>? demandKeys = null;
+        if (DemandOnly)
+        {
+            var latestDemandBatchId = await dbContext.DemandBatches.AsNoTracking()
+                .OrderByDescending(x => x.ImportedAt)
+                .ThenByDescending(x => x.Id)
+                .Select(x => (long?)x.Id)
+                .FirstOrDefaultAsync();
+            demandKeys = latestDemandBatchId is null
+                ? []
+                : (await dbContext.DemandItems.AsNoTracking()
+                    .Where(x => x.DemandBatchId == latestDemandBatchId.Value && x.Ips != "")
+                    .Select(x => x.Ips)
+                    .Distinct()
+                    .ToListAsync())
+                    .Select(StockCodeNormalizer.NormalizeForComparison)
+                    .Where(x => x.Length > 0)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var demandPartCodes = demandKeys
+                .SelectMany(x => new[] { x, x.All(char.IsDigit) ? x.TrimStart('0') : x })
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            query = query.Where(x => demandPartCodes.Contains(x.Ips));
+        }
+
         var parts = await query
             .Include(x => x.BlankMaps.Where(m => m.IsActive))
             .ThenInclude(x => x.CanonicalBlank)
             .ThenInclude(x => x!.Aliases)
             .AsSplitQuery()
             .OrderBy(x => x.Ips)
-            .Take(1000)
+            .Take(string.IsNullOrWhiteSpace(searchValue) ? 1000 : 5000)
             .ToListAsync();
+        if (!string.IsNullOrWhiteSpace(searchValue))
+        {
+            parts = parts
+                .Where(PartMatchesSearch)
+                .Take(1000)
+                .ToList();
+        }
 
         Rows.Clear();
         foreach (var part in parts)
@@ -1078,23 +2422,110 @@ public sealed partial class LibraryViewModel(
                 part.Ips,
                 UiText.Clean(part.Designation),
                 UiText.Clean(part.Name),
+                BuildExternalServiceNote(part),
+                part.RequiresNitriding,
+                part.RequiresHeatTreatment,
+                part.RequiresChemicalOxidation,
+                part.RequiresKeyway,
+                BuildBlankSupplyRequirement(part),
+                part.BlankSupplyRequiresHeatTreatment,
+                part.BlankSupplyRequiresLaserCutting,
                 blank is null ? null : DisplayBlankType(blank.BlankType),
                 UiText.Clean(activeAlias?.SourceName ?? blank?.CanonicalName),
                 UiText.Clean(blank?.Material),
                 activeAlias?.OneCCode,
-                map?.ConsumptionQuantity,
+                ToDisplayConsumptionQuantity(map?.ConsumptionQuantity, effectiveUnit),
                 effectiveUnit,
-                FormatDecimal(map?.ConsumptionQuantity),
-                effectiveUnit is null ? string.Empty : DisplayUnit(effectiveUnit.Value),
+                FormatDecimal(ToDisplayConsumptionQuantity(map?.ConsumptionQuantity, effectiveUnit)),
+                effectiveUnit is null ? string.Empty : DisplayConsumptionUnit(effectiveUnit.Value),
                 map?.BlankLeadTimeDays ?? 30,
                 (map?.BlankLeadTimeDays ?? 30).ToString(CultureInfo.InvariantCulture),
                 UiText.Clean(part.Source),
-                part.UpdatedAt.ToLocalTime().ToString("g")));
+                part.UpdatedAt.ToLocalTime().ToString("g"),
+                map is null ||
+                    blank is null ||
+                    activeAlias is null ||
+                    string.IsNullOrWhiteSpace(activeAlias.OneCCode) ||
+                    map.ConsumptionQuantity <= 0));
         }
 
-        SummaryText = $"Деталей: {Rows.Select(x => x.PartId).Distinct().Count()}; без заготовки: {Rows.Count(x => x.PartBlankMapId is null || x.CanonicalBlankId is null)}";
+        SummaryText = DemandOnly
+            ? $"Деталей: {Rows.Select(x => x.PartId).Distinct().Count()}; без заготовки: {Rows.Count(x => x.PartBlankMapId is null || x.CanonicalBlankId is null)}; в потребности: {demandKeys?.Count ?? 0}"
+            : $"Деталей: {Rows.Select(x => x.PartId).Distinct().Count()}; без заготовки: {Rows.Count(x => x.PartBlankMapId is null || x.CanonicalBlankId is null)}";
         await LoadBlankSuggestionsAsync();
     }
+
+    private bool PartMatchesSearch(Part part)
+    {
+        var searchValue = Search.Trim();
+        var blankValues = part.BlankMaps
+            .Where(m => m.IsActive && m.CanonicalBlank is not null)
+            .SelectMany(m => new[]
+            {
+                m.CanonicalBlank!.CanonicalName,
+                m.CanonicalBlank.Material
+            }.Concat(m.CanonicalBlank.Aliases.SelectMany(a => new[] { a.OneCCode, a.SourceName })));
+        return UiSearchText.ContainsAnyField(searchValue,
+            [part.Ips, part.Designation, part.Name, BuildExternalServiceNote(part), ..blankValues]);
+    }
+
+    private static string BuildExternalServiceNote(Part part)
+    {
+        var notes = new List<string>(4);
+        if (part.RequiresNitriding)
+        {
+            notes.Add("Азотирование");
+        }
+
+        if (part.RequiresHeatTreatment)
+        {
+            notes.Add("ТО");
+        }
+
+        if (part.RequiresChemicalOxidation)
+        {
+            notes.Add("Хим. окс");
+        }
+
+        if (part.RequiresKeyway)
+        {
+            notes.Add("Шпон паз");
+        }
+
+        return string.Join("; ", notes);
+    }
+
+    private static string BuildBlankSupplyRequirement(Part part)
+    {
+        var notes = new List<string>(2);
+        if (part.BlankSupplyRequiresHeatTreatment)
+        {
+            notes.Add("ТО");
+        }
+
+        if (part.BlankSupplyRequiresLaserCutting)
+        {
+            notes.Add("Лазерная резка");
+        }
+
+        return string.Join("; ", notes);
+    }
+
+    private static string BuildObjectCardText(LibraryRow row) =>
+        $"1 Информация по детали\n" +
+        $"IPS: {row.Ips}\n" +
+        $"Обозначение: {row.Designation}\n" +
+        $"Наименование: {row.PartName}\n" +
+        $"Вид заготовки: {row.BlankType}\n" +
+        $"Заготовка: {row.BlankName}\n" +
+        $"Материал: {row.Material}\n" +
+        $"Условие поставки заготовки: {row.BlankSupplyRequirement}\n" +
+        $"Код УТ: {row.OneCCode}\n" +
+        $"Норма расхода: {row.Quantity} {row.UnitName}\n" +
+        $"Срок заготовки, дней: {row.BlankLeadTimeDaysText}\n" +
+        $"Услуги: {row.Note}\n" +
+        $"Источник: {row.Source}\n" +
+        $"Обновлено: {row.UpdatedAt}";
 
     private async Task RestoreImportedArchivedLibraryPartsAsync()
     {
@@ -1136,27 +2567,99 @@ public sealed partial class LibraryViewModel(
             return;
         }
 
-        var existingIps = (await dbContext.Parts.AsNoTracking().Select(x => x.Ips).ToListAsync())
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var existingParts = await dbContext.Parts.ToListAsync();
+        var partsByIps = existingParts
+            .GroupBy(x => x.Ips, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.OrderByDescending(p => p.UpdatedAt).First(), StringComparer.OrdinalIgnoreCase);
+        var mskRecords = await dbContext.MskRecords.AsNoTracking().ToListAsync();
+        var mskByIps = mskRecords
+            .Where(x => !string.IsNullOrWhiteSpace(x.Ips))
+            .GroupBy(x => x.Ips, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.OrderByDescending(r => r.ImportedAt).First(), StringComparer.OrdinalIgnoreCase);
+        var mskDetails = MskViewModel.LoadMskDetailsFromReport();
         var added = 0;
-        foreach (var demandPart in demandParts.Where(x => !existingIps.Contains(x.Ips)))
+        foreach (var demandPart in demandParts)
         {
-            var (designation, name) = SplitDesignationAndName(demandPart.Name);
-            dbContext.Parts.Add(new Part
+            mskByIps.TryGetValue(demandPart.Ips, out var mskRecord);
+            var mskDetail = MskViewModel.ResolveMskDetail(mskRecord, mskDetails);
+            var (designation, name) = SplitDesignationAndName(FirstNotEmpty(mskRecord?.Name, demandPart.Name));
+            if (partsByIps.TryGetValue(demandPart.Ips, out var existingPart))
+            {
+                if (!IsArchivedLibrarySource(existingPart.Source))
+                {
+                    continue;
+                }
+
+                if (IsManualLibraryDeleteSource(existingPart.Source))
+                {
+                    continue;
+                }
+
+                existingPart.Source = mskRecord is null ? "Потребность" : "Потребность; МСК";
+                existingPart.Designation = FirstNotEmpty(mskRecord?.Designation, existingPart.Designation, designation);
+                existingPart.Name = FirstNotEmpty(name, existingPart.Name, mskRecord?.Name, demandPart.Name, "Из потребности");
+                existingPart.HasMsk = existingPart.HasMsk || mskRecord is not null;
+                existingPart.UpdatedAt = DateTime.UtcNow;
+                await TryAttachMskBlankAsync(existingPart, mskDetail);
+                added++;
+                continue;
+            }
+
+            var part = new Part
             {
                 Ips = demandPart.Ips,
-                Designation = designation,
-                Name = FirstNotEmpty(name, demandPart.Name, "Из потребности"),
-                Source = "Потребность"
-            });
+                Designation = FirstNotEmpty(mskRecord?.Designation, designation),
+                Name = FirstNotEmpty(name, mskRecord?.Name, demandPart.Name, "Из потребности"),
+                HasMsk = mskRecord is not null,
+                Source = mskRecord is null ? "Потребность" : "Потребность; МСК"
+            };
+            dbContext.Parts.Add(part);
+            partsByIps[part.Ips] = part;
+            await TryAttachMskBlankAsync(part, mskDetail);
             added++;
         }
 
         if (added > 0)
         {
             await dbContext.SaveChangesAsync();
-            EditorStatus = $"Добавлено новых деталей из потребности: {added}.";
+            EditorStatus = $"Добавлено или возвращено деталей из потребности: {added}.";
         }
+    }
+
+    private async Task TryAttachMskBlankAsync(Part part, MskCsvDetail? mskDetail)
+    {
+        if (mskDetail is null || string.IsNullOrWhiteSpace(mskDetail.OneCCode))
+        {
+            return;
+        }
+
+        var alias = await dbContext.BlankAliases
+            .Include(x => x.CanonicalBlank)
+            .Where(x => x.IsActive && x.CanonicalBlank != null && x.CanonicalBlank.IsActive)
+            .FirstOrDefaultAsync(x => x.OneCCode == mskDetail.OneCCode);
+        if (alias?.CanonicalBlank is null)
+        {
+            return;
+        }
+
+        var quantity = decimal.TryParse(
+            (mskDetail.ConsumptionQuantity ?? string.Empty).Trim().Replace('.', ','),
+            NumberStyles.Number,
+            CultureInfo.GetCultureInfo("ru-RU"),
+            out var parsedQuantity)
+            ? parsedQuantity
+            : 1m;
+        dbContext.PartBlankMaps.Add(new PartBlankMap
+        {
+            Part = part,
+            CanonicalBlank = alias.CanonicalBlank,
+            ConsumptionQuantity = quantity > 0 ? quantity : 1m,
+            ConsumptionUnit = ParseConsumptionUnit(mskDetail.UnitName, alias.CanonicalBlank.BaseUnit),
+            BlankLeadTimeDays = 30,
+            IsPrimary = true,
+            IsActive = true,
+            Source = "Потребность; МСК; НСИ"
+        });
     }
 
     [RelayCommand]
@@ -1164,7 +2667,7 @@ public sealed partial class LibraryViewModel(
     {
         var query = dbContext.CanonicalBlanks.AsNoTracking()
             .Include(x => x.Aliases)
-            .Where(x => x.IsActive);
+            .Where(x => x.IsActive && x.Aliases.Any(a => a.IsActive));
 
         var selectedType = SelectedBlankType.Value;
         var useDetectedShapeFilters = selectedType is BlankType.Unknown or BlankType.RoundBar or BlankType.SquareBar or BlankType.HexBar or BlankType.Sheet or BlankType.Plate or BlankType.PipeRound or BlankType.PipeRectangular;
@@ -1184,12 +2687,12 @@ public sealed partial class LibraryViewModel(
                 query = query.Where(x => x.BlankType == normalized.BlankType);
             }
 
-            if (useDetectedShapeFilters && normalized.Diameter is not null)
+            if (useDetectedShapeFilters && normalized.Diameter is not null && ShouldApplyExactDimensionFilter(searchText, 'D'))
             {
                 query = query.Where(x => x.DiameterMm == normalized.Diameter);
             }
 
-            if (useDetectedShapeFilters && normalized.Width is not null)
+            if (useDetectedShapeFilters && normalized.Width is not null && ShouldApplyExactDimensionFilter(searchText, 'W'))
             {
                 query = query.Where(x => x.WidthMm == normalized.Width);
             }
@@ -1200,20 +2703,24 @@ public sealed partial class LibraryViewModel(
                 query = query.Where(x => x.Material != null && x.Material.ToUpper().Replace(" ", "").Contains(material));
             }
 
+        }
+
+        var blanks = await query
+            .OrderBy(x => x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault() ?? x.CanonicalName)
+            .Take(string.IsNullOrWhiteSpace(searchText) ? 50 : 5000)
+            .ToListAsync();
+        if (!string.IsNullOrWhiteSpace(searchText))
+        {
             var parts = searchText.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             var namePart = parts.FirstOrDefault();
             var codePart = parts.Length > 1 ? parts[^1] : null;
-            query = query.Where(x =>
-                x.CanonicalName.Contains(searchText) ||
-                (x.Material != null && x.Material.Contains(searchText)) ||
-                x.Aliases.Any(a => a.OneCCode.Contains(searchText) || a.SourceName.Contains(searchText)) ||
-                (!string.IsNullOrWhiteSpace(namePart) && (x.CanonicalName.Contains(namePart) || x.Aliases.Any(a => a.SourceName.Contains(namePart)))) ||
-                (!string.IsNullOrWhiteSpace(codePart) && x.Aliases.Any(a => a.OneCCode.Contains(codePart) || a.SourceName.Contains(codePart))));
+            blanks = blanks
+                .Where(x => BlankMatchesSearch(x, searchText, namePart, codePart))
+                .Take(50)
+                .ToList();
         }
 
-        var options = await query
-            .OrderBy(x => x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault() ?? x.CanonicalName)
-            .Take(50)
+        var options = blanks
             .Select(x => new LibraryBlankOption(
                 x.Id,
                 x.BlankType,
@@ -1222,7 +2729,7 @@ public sealed partial class LibraryViewModel(
                 x.Material,
                 x.BaseUnit,
                 x.Aliases.Where(a => a.IsActive).Select(a => a.OneCCode).FirstOrDefault()))
-            .ToListAsync();
+            .ToList();
 
         BlankSuggestions.Clear();
         foreach (var option in options)
@@ -1271,6 +2778,12 @@ public sealed partial class LibraryViewModel(
                 Ips = ips,
                 Designation = NullIfWhiteSpace(EditDesignation),
                 Name = EditPartName.Trim(),
+                RequiresNitriding = EditRequiresNitriding,
+                RequiresHeatTreatment = EditRequiresHeatTreatment,
+                RequiresChemicalOxidation = EditRequiresChemicalOxidation,
+                RequiresKeyway = EditRequiresKeyway,
+                BlankSupplyRequiresHeatTreatment = EditBlankSupplyRequiresHeatTreatment,
+                BlankSupplyRequiresLaserCutting = EditBlankSupplyRequiresLaserCutting,
                 Source = NullIfWhiteSpace(EditSource) ?? "Ручной ввод"
             };
             dbContext.Parts.Add(part);
@@ -1279,6 +2792,12 @@ public sealed partial class LibraryViewModel(
         {
             part.Designation = NullIfWhiteSpace(EditDesignation);
             part.Name = EditPartName.Trim();
+            part.RequiresNitriding = EditRequiresNitriding;
+            part.RequiresHeatTreatment = EditRequiresHeatTreatment;
+            part.RequiresChemicalOxidation = EditRequiresChemicalOxidation;
+            part.RequiresKeyway = EditRequiresKeyway;
+            part.BlankSupplyRequiresHeatTreatment = EditBlankSupplyRequiresHeatTreatment;
+            part.BlankSupplyRequiresLaserCutting = EditBlankSupplyRequiresLaserCutting;
             part.Source = NullIfWhiteSpace(EditSource) ?? part.Source;
             part.UpdatedAt = DateTime.UtcNow;
         }
@@ -1306,6 +2825,8 @@ public sealed partial class LibraryViewModel(
             return;
         }
 
+        var storedQuantity = ToStoredConsumptionQuantity(quantity, SelectedUnit);
+        var storedUnit = SelectedUnit.Value;
         var sameActiveMap = part.BlankMaps.FirstOrDefault(x => x.CanonicalBlankId == selectedBlank.Id && x.IsActive);
         if (sameActiveMap is null)
         {
@@ -1320,8 +2841,8 @@ public sealed partial class LibraryViewModel(
             {
                 Part = part,
                 CanonicalBlankId = selectedBlank.Id,
-                ConsumptionQuantity = quantity,
-                ConsumptionUnit = SelectedUnit.Value,
+                ConsumptionQuantity = storedQuantity,
+                ConsumptionUnit = storedUnit,
                 BlankLeadTimeDays = leadTimeDays,
                 Source = NullIfWhiteSpace(EditSource) ?? "Ручной ввод",
                 IsPrimary = true,
@@ -1337,8 +2858,8 @@ public sealed partial class LibraryViewModel(
                 activeMap.UpdatedAt = DateTime.UtcNow;
             }
 
-            sameActiveMap.ConsumptionQuantity = quantity;
-            sameActiveMap.ConsumptionUnit = SelectedUnit.Value;
+            sameActiveMap.ConsumptionQuantity = storedQuantity;
+            sameActiveMap.ConsumptionUnit = storedUnit;
             sameActiveMap.BlankLeadTimeDays = leadTimeDays;
             sameActiveMap.Source = NullIfWhiteSpace(EditSource) ?? sameActiveMap.Source;
             sameActiveMap.IsPrimary = true;
@@ -1374,14 +2895,14 @@ public sealed partial class LibraryViewModel(
                 : query.Where(x => x.BlankType == selectedType);
         }
 
-        query = query.Where(x =>
-            x.CanonicalName.Contains(searchText) ||
-            x.Aliases.Any(a => a.OneCCode.Contains(searchText) || a.SourceName.Contains(searchText)) ||
-            (!string.IsNullOrWhiteSpace(namePart) && (x.CanonicalName.Contains(namePart) || x.Aliases.Any(a => a.SourceName.Contains(namePart)))) ||
-            (!string.IsNullOrWhiteSpace(codePart) && x.Aliases.Any(a => a.OneCCode.Contains(codePart) || a.SourceName.Contains(codePart))));
+        var blanks = await query
+            .OrderBy(x => x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault() ?? x.CanonicalName)
+            .Take(5000)
+            .ToListAsync();
 
-        return await query
-            .OrderBy(x => x.Aliases.Any(a => a.OneCCode == codePart) ? 0 : 1)
+        return blanks
+            .Where(x => BlankMatchesSearch(x, searchText, namePart, codePart))
+            .OrderBy(x => x.Aliases.Any(a => UiSearchText.EqualsNormalized(a.OneCCode, codePart)) ? 0 : 1)
             .ThenBy(x => x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault() ?? x.CanonicalName)
             .Select(x => new LibraryBlankOption(
                 x.Id,
@@ -1391,7 +2912,40 @@ public sealed partial class LibraryViewModel(
                 x.Material,
                 x.BaseUnit,
                 x.Aliases.Where(a => a.IsActive).Select(a => a.OneCCode).FirstOrDefault()))
-            .FirstOrDefaultAsync();
+            .FirstOrDefault();
+    }
+
+    private static bool BlankMatchesSearch(CanonicalBlank blank, string searchText, string? namePart = null, string? codePart = null) =>
+        UiSearchText.Contains(blank.CanonicalName, searchText) ||
+        UiSearchText.Contains(blank.Material, searchText) ||
+        blank.Aliases.Any(a => UiSearchText.Contains(a.OneCCode, searchText) || UiSearchText.Contains(a.SourceName, searchText)) ||
+        BlankMatchesAllSearchTokens(blank, searchText) ||
+        (!string.IsNullOrWhiteSpace(namePart) && (UiSearchText.Contains(blank.CanonicalName, namePart) || blank.Aliases.Any(a => UiSearchText.Contains(a.SourceName, namePart)))) ||
+        (!string.IsNullOrWhiteSpace(codePart) && blank.Aliases.Any(a => UiSearchText.Contains(a.OneCCode, codePart) || UiSearchText.Contains(a.SourceName, codePart)));
+
+    private static bool ShouldApplyExactDimensionFilter(string searchText, char marker)
+    {
+        var match = Regex.Match(searchText, $@"(?<![\p{{L}}\p{{N}}]){marker}\s*(\d+(?:[,.]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (!match.Success)
+        {
+            return true;
+        }
+
+        var value = match.Groups[1].Value;
+        return value.Contains('.') || value.Contains(',') || value.Count(char.IsDigit) >= 3;
+    }
+
+    private static bool BlankMatchesAllSearchTokens(CanonicalBlank blank, string searchText)
+    {
+        var tokens = searchText
+            .Split([' ', '\t', '\r', '\n', '|', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(x => x.Length > 0)
+            .ToArray();
+
+        return tokens.Length > 1 && tokens.All(token =>
+            UiSearchText.Contains(blank.CanonicalName, token) ||
+            UiSearchText.Contains(blank.Material, token) ||
+            blank.Aliases.Any(a => UiSearchText.Contains(a.OneCCode, token) || UiSearchText.Contains(a.SourceName, token)));
     }
 
     [RelayCommand]
@@ -1404,57 +2958,55 @@ public sealed partial class LibraryViewModel(
             return;
         }
 
-        suppressSelectedRowEditorLoad = true;
-        try
+        SelectedRow = row;
+        EditIps = row.Ips;
+        EditDesignation = row.Designation ?? string.Empty;
+        EditRequiresNitriding = row.RequiresNitriding;
+        EditRequiresHeatTreatment = row.RequiresHeatTreatment;
+        EditRequiresChemicalOxidation = row.RequiresChemicalOxidation;
+        EditRequiresKeyway = row.RequiresKeyway;
+        EditBlankSupplyRequiresHeatTreatment = row.BlankSupplyRequiresHeatTreatment;
+        EditBlankSupplyRequiresLaserCutting = row.BlankSupplyRequiresLaserCutting;
+        EditPartName = row.PartName;
+        ConsumptionQuantity = row.ConsumptionQuantity ?? 1m;
+        ConsumptionQuantityText = FormatDecimal(ConsumptionQuantity);
+        BlankLeadTimeDaysText = row.BlankLeadTimeDays.ToString(CultureInfo.InvariantCulture);
+        SelectedUnit = GetConsumptionUnitOption(row.ConsumptionUnit);
+        EditSource = row.Source ?? "Ручной ввод";
+        BlankSearch = row.BlankName ?? string.Empty;
+
+        if (row.CanonicalBlankId is not null)
         {
-            SelectedRow = row;
-            EditIps = row.Ips;
-            EditDesignation = row.Designation ?? string.Empty;
-            EditPartName = row.PartName;
-            ConsumptionQuantity = row.ConsumptionQuantity ?? 1m;
-            ConsumptionQuantityText = FormatDecimal(ConsumptionQuantity);
-            BlankLeadTimeDaysText = row.BlankLeadTimeDays.ToString(CultureInfo.InvariantCulture);
-            SelectedUnit = UnitTypes.FirstOrDefault(x => x.Value == row.ConsumptionUnit) ?? UnitTypes[0];
-            EditSource = row.Source ?? "Ручной ввод";
-            BlankSearch = row.BlankName ?? string.Empty;
-
-            if (row.CanonicalBlankId is not null)
+            var blank = await dbContext.CanonicalBlanks.AsNoTracking().FirstOrDefaultAsync(x => x.Id == row.CanonicalBlankId.Value);
+            if (blank is not null)
             {
-                var blank = await dbContext.CanonicalBlanks.AsNoTracking().FirstOrDefaultAsync(x => x.Id == row.CanonicalBlankId.Value);
-                if (blank is not null)
-                {
-                    SelectedBlankType = BlankTypes.FirstOrDefault(x => x.Value == blank.BlankType) ?? BlankTypes[0];
-                }
+                SelectedBlankType = BlankTypes.FirstOrDefault(x => x.Value == blank.BlankType) ?? BlankTypes[0];
             }
-
-            await LoadBlankSuggestionsAsync();
-            SelectedBlank = row.CanonicalBlankId is null ? null : BlankSuggestions.FirstOrDefault(x => x.Id == row.CanonicalBlankId.Value);
-            if (SelectedBlank is null && row.CanonicalBlankId is not null)
-            {
-                var option = await dbContext.CanonicalBlanks.AsNoTracking()
-                    .Where(x => x.Id == row.CanonicalBlankId.Value)
-                    .Select(x => new LibraryBlankOption(
-                        x.Id,
-                        x.BlankType,
-                        x.CanonicalName,
-                        x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault(),
-                        x.Material,
-                        x.BaseUnit,
-                        x.Aliases.Where(a => a.IsActive).Select(a => a.OneCCode).FirstOrDefault()))
-                    .FirstOrDefaultAsync();
-                if (option is not null)
-                {
-                    BlankSuggestions.Insert(0, option);
-                    SelectedBlank = option;
-                }
-            }
-
-            EditorStatus = $"Строка загружена в редактор: {row.Ips}.";
         }
-        finally
+
+        await LoadBlankSuggestionsAsync();
+        SelectedBlank = row.CanonicalBlankId is null ? null : BlankSuggestions.FirstOrDefault(x => x.Id == row.CanonicalBlankId.Value);
+        if (SelectedBlank is null && row.CanonicalBlankId is not null)
         {
-            suppressSelectedRowEditorLoad = false;
+            var option = await dbContext.CanonicalBlanks.AsNoTracking()
+                .Where(x => x.Id == row.CanonicalBlankId.Value)
+                .Select(x => new LibraryBlankOption(
+                    x.Id,
+                    x.BlankType,
+                    x.CanonicalName,
+                    x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault(),
+                    x.Material,
+                    x.BaseUnit,
+                    x.Aliases.Where(a => a.IsActive).Select(a => a.OneCCode).FirstOrDefault()))
+                .FirstOrDefaultAsync();
+            if (option is not null)
+            {
+                BlankSuggestions.Insert(0, option);
+                SelectedBlank = option;
+            }
         }
+
+        EditorStatus = $"Строка загружена в редактор: {row.Ips}.";
     }
 
     [RelayCommand]
@@ -1590,13 +3142,28 @@ public sealed partial class LibraryViewModel(
 
         if (row.PartBlankMapId is not null)
         {
-            var map = part.BlankMaps.FirstOrDefault(x => x.Id == row.PartBlankMapId.Value);
-            if (map is not null)
+            foreach (var map in part.BlankMaps.Where(x => x.IsActive))
             {
                 map.IsActive = false;
                 map.IsPrimary = false;
                 map.UpdatedAt = DateTime.UtcNow;
             }
+
+            var demandItems = await dbContext.DemandItems.Where(x => x.PartId == part.Id).ToListAsync();
+            foreach (var demandItem in demandItems)
+            {
+                demandItem.PartId = null;
+            }
+
+            part.Source = BuildArchivedSource(part.Source, "[MANUAL_LIBRARY_DELETE] Удалено из библиотеки");
+            part.UpdatedAt = DateTime.UtcNow;
+            EditorStatus = $"Деталь убрана из библиотеки: {row.Ips}.";
+            await dbContext.SaveChangesAsync();
+            if (reload)
+            {
+                await LoadAsync();
+            }
+            return;
         }
         else if (row.CanonicalBlankId is null)
         {
@@ -1606,7 +3173,7 @@ public sealed partial class LibraryViewModel(
                 demandItem.PartId = null;
             }
 
-            part.Source = BuildArchivedSource(part.Source, "Удалено из библиотеки");
+            part.Source = BuildArchivedSource(part.Source, "[MANUAL_LIBRARY_DELETE] Удалено из библиотеки");
             part.UpdatedAt = DateTime.UtcNow;
             EditorStatus = $"Деталь без заготовки убрана из библиотеки: {row.Ips}.";
             await dbContext.SaveChangesAsync();
@@ -1640,7 +3207,7 @@ public sealed partial class LibraryViewModel(
     private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) ?? string.Empty;
     private static bool IsDemandLibraryPartCandidate(DemandItem item)
     {
-        if (IsArchivedLibrarySource(item.Part?.Source))
+        if (IsManualLibraryDeleteSource(item.Part?.Source))
         {
             return false;
         }
@@ -1651,8 +3218,14 @@ public sealed partial class LibraryViewModel(
             return false;
         }
 
+        var ips = UiText.Clean(item.Ips).Trim();
+        if (!IsValidDemandPartIps(ips))
+        {
+            return false;
+        }
+
         var name = UiText.Clean(item.SourcePartName);
-        if (string.IsNullOrWhiteSpace(item.Ips) || string.IsNullOrWhiteSpace(name))
+        if (string.IsNullOrWhiteSpace(name))
         {
             return false;
         }
@@ -1673,6 +3246,17 @@ public sealed partial class LibraryViewModel(
 
     private static bool IsArchivedLibrarySource(string? source) =>
         !string.IsNullOrWhiteSpace(source) && source.Contains("[ARCHIVED_LIBRARY]", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsManualLibraryDeleteSource(string? source) =>
+        !string.IsNullOrWhiteSpace(source) && source.Contains("[MANUAL_LIBRARY_DELETE]", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsValidDemandPartIps(string? value)
+    {
+        var text = UiText.Clean(value).Trim();
+        return text.Length is >= 6 and <= 11 &&
+            text.Any(ch => ch != '0') &&
+            text.All(char.IsDigit);
+    }
 
     private static string? RestoreLibrarySource(string? source)
     {
@@ -1738,14 +3322,51 @@ public sealed partial class LibraryViewModel(
 
     private static string DisplayUnit(MeasurementUnit unit) => UiText.DisplayUnit(unit);
 
+    private static DisplayOption<MeasurementUnit> GetConsumptionUnitOption(MeasurementUnit? unit) =>
+        unit == MeasurementUnit.Meter
+            ? UiText.ConsumptionUnitTypes.FirstOrDefault(UiText.IsMillimeterOption) ?? UiText.ConsumptionUnitTypes.First(x => x.Value == MeasurementUnit.Meter)
+            : UiText.ConsumptionUnitTypes.FirstOrDefault(x => x.Value == unit) ?? UiText.ConsumptionUnitTypes[0];
+
+    private static decimal? ToDisplayConsumptionQuantity(decimal? quantity, MeasurementUnit? unit) =>
+        quantity is not null && unit == MeasurementUnit.Meter
+            ? FromStoredMeterQuantity(quantity.Value)
+            : quantity;
+
+    private static decimal FromStoredMeterQuantity(decimal quantity) => quantity * 1000m;
+
+    private static decimal ToStoredConsumptionQuantity(decimal quantity, DisplayOption<MeasurementUnit> unit) =>
+        UiText.IsMillimeterOption(unit) ? quantity / 1000m : quantity;
+
+    private static string DisplayConsumptionUnit(MeasurementUnit unit) =>
+        unit == MeasurementUnit.Meter ? "мм" : DisplayUnit(unit);
+
+    private static MeasurementUnit ParseConsumptionUnit(string? value, MeasurementUnit fallback)
+    {
+        var text = UiText.Clean(value).ToLowerInvariant();
+        if (text.Contains("пог", StringComparison.Ordinal) || text.Contains("м", StringComparison.Ordinal))
+        {
+            return MeasurementUnit.Meter;
+        }
+
+        if (text.Contains("шт", StringComparison.Ordinal))
+        {
+            return MeasurementUnit.Piece;
+        }
+
+        return fallback;
+    }
+
     private static string DisplayBlankType(BlankType type) => UiText.DisplayBlankType(type);
 }
 
 public sealed partial class NormalizationViewModel(
     BlankDemandPlannerDbContext dbContext,
     IExcelImportService excelImportService,
-    IFileDialogService fileDialogService) : ObservableObject
+    IFileDialogService fileDialogService,
+    IOneCNomenclatureService? oneCNomenclatureService = null) : ObservableObject
 {
+    private readonly IOneCNomenclatureService oneCService = oneCNomenclatureService ?? new EmptyOneCNomenclatureService();
+
     private static readonly BlankType[] MeterBasedBlankTypes =
     [
         BlankType.RoundBar,
@@ -1753,29 +3374,28 @@ public sealed partial class NormalizationViewModel(
         BlankType.HexBar,
         BlankType.PipeRound,
         BlankType.PipeRectangular,
-        BlankType.Angle,
-        BlankType.Channel,
-        BlankType.IBeam,
-        BlankType.BronzeBar
+        BlankType.Angle
     ];
 
     public ObservableCollection<NsiBlankRow> Rows { get; } = [];
     public ObservableCollection<NsiUsageRow> UsageRows { get; } = [];
     public ObservableCollection<string> MaterialSuggestions { get; } = [];
+    public ObservableCollection<string> MaterialGostSuggestions { get; } = [];
+    public ObservableCollection<string> ProfileGostSuggestions { get; } = [];
 
-    public IReadOnlyList<DisplayOption<BlankType>> BlankTypes { get; } = UiText.BlankTypes;
-    public IReadOnlyList<DisplayOption<BlankType?>> BlankTypeFilters { get; } = UiText.BlankTypeFiltersWithUnknown;
-    public IReadOnlyList<DisplayOption<MeasurementUnit>> UnitTypes { get; } = UiText.UnitTypes;
+    public ObservableCollection<DisplayOption<BlankType>> BlankTypes { get; } = [..UiReferenceData.BlankTypes()];
+    public ObservableCollection<DisplayOption<BlankType?>> BlankTypeFilters { get; } = [..UiReferenceData.BlankTypeFilters(includeUnknown: true)];
+    public ObservableCollection<DisplayOption<MeasurementUnit>> UnitTypes { get; } = [..UiReferenceData.UnitTypes()];
 
     [ObservableProperty] private string search = string.Empty;
-    [ObservableProperty] private DisplayOption<BlankType?> selectedBlankTypeFilter = UiText.BlankTypeFiltersWithUnknown[0];
+    [ObservableProperty] private DisplayOption<BlankType?> selectedBlankTypeFilter = UiReferenceData.BlankTypeFilters(includeUnknown: true)[0];
     [ObservableProperty] private string sizeFilter = string.Empty;
     [ObservableProperty] private string materialFilter = string.Empty;
     [ObservableProperty] private bool duplicatesOnly;
     [ObservableProperty] private string statusText = string.Empty;
     [ObservableProperty] private NsiBlankRow? selectedRow;
-    [ObservableProperty] private DisplayOption<BlankType> editBlankType = UiText.BlankTypes.First(x => x.Value == BlankType.Unknown);
-    [ObservableProperty] private DisplayOption<MeasurementUnit> editUnit = UiText.UnitTypes[0];
+    [ObservableProperty] private DisplayOption<BlankType> editBlankType = UiReferenceData.BlankTypes().First(x => x.Value == BlankType.Unknown);
+    [ObservableProperty] private DisplayOption<MeasurementUnit> editUnit = UiReferenceData.UnitTypes()[0];
     [ObservableProperty] private string editOneCCode = string.Empty;
     [ObservableProperty] private string editSourceName = string.Empty;
     [ObservableProperty] private string editMaterial = string.Empty;
@@ -1785,15 +3405,33 @@ public sealed partial class NormalizationViewModel(
     [ObservableProperty] private bool isUsagePanelVisible = true;
     [ObservableProperty] private string usageStatusText = "Выберите заготовку";
     [ObservableProperty] private string summaryText = "Строк НСИ: 0";
-    private bool suppressAutoRestoreNsi;
     public string UsagePanelButtonText => IsUsagePanelVisible ? "Скрыть применяемость" : "Отобразить применяемость";
+
+    private enum NsiSuggestionKind
+    {
+        Material,
+        MaterialGost,
+        ProfileGost
+    }
+
+    private bool oneCNamesRefreshAttempted;
+    private bool suppressNsiEditorAutoDefaults;
+    private string? lastAutoMaterialGost;
+    private string? lastAutoProfileGost;
 
     partial void OnSearchChanged(string value) => _ = LoadAsync();
     partial void OnSelectedBlankTypeFilterChanged(DisplayOption<BlankType?> value) => _ = LoadAsync();
     partial void OnSizeFilterChanged(string value) => _ = LoadAsync();
     partial void OnMaterialFilterChanged(string value) => _ = LoadAsync();
     partial void OnDuplicatesOnlyChanged(bool value) => _ = LoadAsync();
-    partial void OnEditMaterialChanged(string value) => _ = LoadMaterialSuggestionsAsync(value);
+    partial void OnEditMaterialChanged(string value)
+    {
+        _ = LoadMaterialSuggestionsAsync(value);
+        _ = ApplyMaterialGostDefaultAsync(value);
+    }
+    partial void OnEditMaterialGostChanged(string value) => _ = LoadMaterialGostSuggestionsAsync(value);
+    partial void OnEditProfileGostChanged(string value) => _ = LoadProfileGostSuggestionsAsync(value);
+    partial void OnEditBlankTypeChanged(DisplayOption<BlankType> value) => _ = ApplyProfileGostDefaultAsync(value.Value);
     partial void OnSelectedRowChanged(NsiBlankRow? value) => _ = LoadUsageAsync(value);
     partial void OnStatusTextChanged(string value)
     {
@@ -1804,6 +3442,23 @@ public sealed partial class NormalizationViewModel(
         }
     }
     partial void OnIsUsagePanelVisibleChanged(bool value) => OnPropertyChanged(nameof(UsagePanelButtonText));
+
+    public void RefreshReferenceLists()
+    {
+        var editBlankTypeValue = EditBlankType.Value;
+        var selectedBlankTypeFilterValue = SelectedBlankTypeFilter.Value;
+        var editUnitValue = EditUnit.Value;
+
+        UiReferenceData.ReplaceOptions(BlankTypes, UiReferenceData.BlankTypes());
+        UiReferenceData.ReplaceOptions(BlankTypeFilters, UiReferenceData.BlankTypeFilters(includeUnknown: true));
+        UiReferenceData.ReplaceOptions(UnitTypes, UiReferenceData.UnitTypes());
+
+        EditBlankType = BlankTypes.FirstOrDefault(x => x.Value == editBlankTypeValue)
+            ?? BlankTypes.FirstOrDefault(x => x.Value == BlankType.Unknown)
+            ?? BlankTypes.First();
+        SelectedBlankTypeFilter = BlankTypeFilters.FirstOrDefault(x => x.Value == selectedBlankTypeFilterValue) ?? BlankTypeFilters.First();
+        EditUnit = UnitTypes.FirstOrDefault(x => x.Value == editUnitValue) ?? UnitTypes.First();
+    }
 
     [RelayCommand]
     private async Task ImportAsync()
@@ -1818,7 +3473,8 @@ public sealed partial class NormalizationViewModel(
         try
         {
             var report = await excelImportService.ImportOneCBlanksAsync(file, null, CancellationToken.None);
-            StatusText = $"Импорт НСИ завершен. Прочитано: {report.ReadRows}; добавлено: {report.AddedRows}; обновлено: {report.UpdatedRows}; ошибок: {report.ErrorRows}.";
+            var refreshedNames = await RefreshImportedNamesFromOneCAsync(Path.GetFileName(file), CancellationToken.None);
+            StatusText = $"Импорт НСИ завершен. Прочитано: {report.ReadRows}; добавлено: {report.AddedRows}; обновлено: {report.UpdatedRows}; актуализировано из 1С: {refreshedNames}; ошибок: {report.ErrorRows}.";
             await LoadAsync();
             MessageBox.Show(StatusText, "НСИ", MessageBoxButton.OK, MessageBoxImage.Information);
         }
@@ -1832,35 +3488,134 @@ public sealed partial class NormalizationViewModel(
     private void ToggleUsagePanel() => IsUsagePanelVisible = !IsUsagePanelVisible;
 
     [RelayCommand]
-    private async Task LoadMaterialSuggestionsAsync(string? value)
+    private async Task AddFromOneCAsync()
     {
-        var text = (value ?? string.Empty).Trim();
-        var query = dbContext.CanonicalBlanks.AsNoTracking()
-            .Where(x => x.IsActive && x.Material != null && x.Material != "");
-
-        if (!string.IsNullOrWhiteSpace(text))
+        var item = await ShowOneCNomenclatureLookupWindowAsync();
+        if (item is null)
         {
-            query = query.Where(x => x.Material!.StartsWith(text) || x.Material.Contains(text));
+            StatusText = "Добавление из 1С отменено.";
+            return;
         }
 
-        var suggestions = await query
-            .Select(x => x.Material!)
-            .Distinct()
-            .OrderBy(x => x)
-            .Take(40)
-            .ToListAsync();
-
-        MaterialSuggestions.Clear();
-        foreach (var material in suggestions.Select(UiText.Clean).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            MaterialSuggestions.Add(material);
-        }
+        SelectedRow = null;
+        EditOneCCode = NormalizeOneCEditorCode(FirstNotEmpty(item.Article, item.Code));
+        EditSourceName = item.Name;
+        EditUnit = UnitTypes.FirstOrDefault(x => x.Value == ParseUnit(item.Unit)) ?? UnitTypes[0];
+        StatusText = $"Позиция 1С выбрана: {EditOneCCode}. Заполните вид, размер и ГОСТы при необходимости, затем сохраните НСИ.";
     }
 
     [RelayCommand]
-    private void EditNsiRow(NsiBlankRow? row)
+    private async Task LoadMaterialSuggestionsAsync(string? value)
     {
-        row ??= SelectedRow;
+        await LoadNsiEditorSuggestionsAsync(value, NsiSuggestionKind.Material, MaterialSuggestions);
+    }
+
+    private async Task LoadMaterialGostSuggestionsAsync(string? value) =>
+        await LoadNsiEditorSuggestionsAsync(value, NsiSuggestionKind.MaterialGost, MaterialGostSuggestions);
+
+    private async Task LoadProfileGostSuggestionsAsync(string? value) =>
+        await LoadNsiEditorSuggestionsAsync(value, NsiSuggestionKind.ProfileGost, ProfileGostSuggestions);
+
+    private async Task LoadNsiEditorSuggestionsAsync(string? value, NsiSuggestionKind kind, ObservableCollection<string> target)
+    {
+        var text = (value ?? string.Empty).Trim();
+        var query = dbContext.BlankAliases.AsNoTracking()
+            .Where(x => x.IsActive && x.CanonicalBlank != null && x.CanonicalBlank.IsActive);
+        var values = kind switch
+        {
+            NsiSuggestionKind.Material => await query.Select(x => x.CanonicalBlank!.Material).ToListAsync(),
+            NsiSuggestionKind.MaterialGost => await query.Select(x => x.CanonicalBlank!.MaterialGost).ToListAsync(),
+            _ => await query.Select(x => x.CanonicalBlank!.ProfileGost).ToListAsync()
+        };
+
+        var suggestions = values
+            .Select(UiText.Clean)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(x => string.IsNullOrWhiteSpace(text) || UiSearchText.Contains(x, text))
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .Take(40)
+            .ToList();
+
+        target.Clear();
+        foreach (var suggestion in suggestions)
+        {
+            target.Add(suggestion);
+        }
+    }
+
+    private async Task ApplyMaterialGostDefaultAsync(string? material)
+    {
+        if (suppressNsiEditorAutoDefaults)
+        {
+            return;
+        }
+
+        var text = UiText.Clean(material).Trim();
+        if (string.IsNullOrWhiteSpace(text) || (!string.IsNullOrWhiteSpace(EditMaterialGost) && !string.Equals(EditMaterialGost, lastAutoMaterialGost, StringComparison.Ordinal)))
+        {
+            return;
+        }
+
+        var blanks = await dbContext.BlankAliases.AsNoTracking()
+            .Where(x => x.IsActive && x.CanonicalBlank != null && x.CanonicalBlank.IsActive)
+            .Select(x => new { x.CanonicalBlank!.Material, x.CanonicalBlank.MaterialGost })
+            .ToListAsync();
+        var materialGost = blanks
+            .Where(x => UiSearchText.EqualsNormalized(x.Material, text))
+            .Select(x => UiText.Clean(x.MaterialGost))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .GroupBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(x => x.Key)
+            .FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(materialGost))
+        {
+            return;
+        }
+
+        lastAutoMaterialGost = materialGost;
+        EditMaterialGost = materialGost;
+    }
+
+    private async Task ApplyProfileGostDefaultAsync(BlankType blankType)
+    {
+        if (suppressNsiEditorAutoDefaults || blankType is BlankType.Purchased or BlankType.Unknown)
+        {
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(EditProfileGost) && !string.Equals(EditProfileGost, lastAutoProfileGost, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var values = await dbContext.BlankAliases.AsNoTracking()
+            .Where(x => x.IsActive && x.CanonicalBlank != null && x.CanonicalBlank.IsActive && x.CanonicalBlank.BlankType == blankType)
+            .Select(x => x.CanonicalBlank!.ProfileGost)
+            .ToListAsync();
+        var profileGost = values
+            .Select(UiText.Clean)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .GroupBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(x => x.Key)
+            .FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(profileGost))
+        {
+            return;
+        }
+
+        lastAutoProfileGost = profileGost;
+        EditProfileGost = profileGost;
+    }
+
+    [RelayCommand]
+    private void EditNsiRow(object? parameter)
+    {
+        var row = parameter as NsiBlankRow ?? SelectedRow;
         if (row is null)
         {
             StatusText = "Выберите строку НСИ для редактирования.";
@@ -1884,6 +3639,8 @@ public sealed partial class NormalizationViewModel(
         EditSize = string.Empty;
         EditMaterialGost = string.Empty;
         EditProfileGost = string.Empty;
+        lastAutoMaterialGost = null;
+        lastAutoProfileGost = null;
         StatusText = "Заполните данные заготовки и нажмите \"Сохранить правку НСИ\".";
     }
 
@@ -1904,7 +3661,7 @@ public sealed partial class NormalizationViewModel(
             return;
         }
 
-        var code = NullIfWhiteSpace(EditOneCCode);
+        var code = NullIfWhiteSpace(NormalizeOneCEditorCode(EditOneCCode));
         var name = NullIfWhiteSpace(EditSourceName);
         if (code is null)
         {
@@ -1953,9 +3710,9 @@ public sealed partial class NormalizationViewModel(
         try
         {
             await dbContext.SaveChangesAsync();
-            StatusText = $"Сохранено: {code}, {DisplayBlankType(blank.BlankType)}, {blank.Material ?? "материал не указан"}, {FormatSize(blank)}";
             await LoadAsync();
             SelectedRow = Rows.FirstOrDefault(x => x.AliasId == aliasId);
+            StatusText = $"Деталь добавлена в список: {code}.";
         }
         catch (Exception ex)
         {
@@ -1982,60 +3739,257 @@ public sealed partial class NormalizationViewModel(
     }
 
     [RelayCommand]
-    private async Task ArchiveSelectedAsync() => await ArchiveSelectedRowsAsync(SelectedRow);
-
-
-    [RelayCommand]
     private async Task DeleteSelectedAsync() => await DeleteSelectedRowsAsync(SelectedRow);
 
 
     [RelayCommand]
     private async Task DeleteSelectedRowsAsync(object? parameter)
     {
-        var rows = GetSelectedNsiRows(parameter).DistinctBy(x => x.AliasId).ToArray();
-        if (rows.Length == 0)
+        try
         {
-            StatusText = "Выберите одну или несколько строк НСИ для удаления.";
-            return;
-        }
-
-        suppressAutoRestoreNsi = true;
-        var aliasIds = rows.Select(x => x.AliasId).Distinct().ToArray();
-        var aliases = await dbContext.BlankAliases
-            .Where(x => aliasIds.Contains(x.Id))
-            .ToListAsync();
-        var aliasesWithHistory = await dbContext.StockItems.AsNoTracking()
-            .Where(x => x.BlankAliasId.HasValue && aliasIds.Contains(x.BlankAliasId.Value))
-            .Select(x => x.BlankAliasId!.Value)
-            .Distinct()
-            .ToListAsync();
-        var historyIds = aliasesWithHistory.ToHashSet();
-        var archived = 0;
-        var deleted = 0;
-
-        foreach (var alias in aliases)
-        {
-            if (historyIds.Contains(alias.Id))
+            var rows = GetSelectedNsiRows(parameter).DistinctBy(x => x.AliasId).ToArray();
+            if (rows.Length == 0)
             {
-                alias.IsActive = false;
-                alias.UpdatedAt = DateTime.UtcNow;
-                archived++;
+                StatusText = "Выберите одну или несколько строк НСИ для удаления.";
+                return;
+            }
+
+            var aliasIds = rows.Select(x => x.AliasId).Distinct().ToArray();
+            var canonicalIds = rows.Select(x => x.CanonicalBlankId).Distinct().ToArray();
+            var usageCount = await dbContext.PartBlankMaps.AsNoTracking()
+                .CountAsync(x => x.IsActive && canonicalIds.Contains(x.CanonicalBlankId));
+            if (usageCount > 0)
+            {
+                var confirmation = MessageBox.Show(
+                    $"По выбранной НСИ есть применяемость: {usageCount} активных связей с деталями.\n\nПосле удаления эти связи будут удалены, и детали останутся без этой заготовки в расчетах. Подтвердить удаление?",
+                    "Удаление НСИ с применяемостью",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning);
+                if (confirmation != MessageBoxResult.Yes)
+                {
+                    StatusText = "Удаление НСИ отменено.";
+                    return;
+                }
+            }
+
+            var aliases = await dbContext.BlankAliases
+                .Include(x => x.CanonicalBlank)
+                .Where(x => aliasIds.Contains(x.Id))
+                .ToListAsync();
+            var allAliasesByCanonical = await dbContext.BlankAliases
+                .Where(x => canonicalIds.Contains(x.CanonicalBlankId))
+                .ToListAsync();
+            var canonicalIdsToDelete = allAliasesByCanonical
+                .GroupBy(x => x.CanonicalBlankId)
+                .Where(x => x.All(a => aliasIds.Contains(a.Id)))
+                .Select(x => x.Key)
+                .ToArray();
+            var undoSnapshot = await SnapshotNsiDeleteAsync(aliasIds, canonicalIdsToDelete);
+
+            var stockLinks = await dbContext.StockItems
+                .Where(x => x.BlankAliasId.HasValue && aliasIds.Contains(x.BlankAliasId.Value))
+                .ToListAsync();
+            foreach (var stock in stockLinks)
+            {
+                stock.BlankAliasId = null;
+                stock.BlankAlias = null;
+            }
+
+            if (canonicalIdsToDelete.Length > 0)
+            {
+                var maps = await dbContext.PartBlankMaps
+                    .Where(x => canonicalIdsToDelete.Contains(x.CanonicalBlankId))
+                    .ToListAsync();
+                dbContext.PartBlankMaps.RemoveRange(maps);
+
+                var calculationItems = await dbContext.CalculationItems
+                    .Where(x => x.CanonicalBlankId.HasValue && canonicalIdsToDelete.Contains(x.CanonicalBlankId.Value))
+                    .ToListAsync();
+                foreach (var item in calculationItems)
+                {
+                    item.CanonicalBlankId = null;
+                    item.CanonicalBlank = null;
+                }
+            }
+
+            foreach (var alias in aliases)
+            {
+                dbContext.BlankAliases.Remove(alias);
+            }
+
+            if (canonicalIdsToDelete.Length > 0)
+            {
+                var blanks = await dbContext.CanonicalBlanks
+                    .Where(x => canonicalIdsToDelete.Contains(x.Id))
+                    .ToListAsync();
+                dbContext.CanonicalBlanks.RemoveRange(blanks);
+            }
+
+            await dbContext.SaveChangesAsync();
+            StatusText = $"Удалено позиций НСИ: {aliases.Count}.";
+            UndoCenter.Push("Отмена удаления НСИ", async () => await RestoreNsiDeleteAsync(undoSnapshot));
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                dbContext.Logs.Add(new AppLog
+                {
+                    Level = "Error",
+                    Message = "Ошибка удаления НСИ",
+                    Exception = ex.ToString()
+                });
+                await dbContext.SaveChangesAsync();
+            }
+            catch
+            {
+                // Keep the UI responsive even if logging fails.
+            }
+
+            StatusText = "Не удалось удалить НСИ. Подробности записаны в лог.";
+            MessageBox.Show($"Не удалось удалить НСИ.\n{ex.GetBaseException().Message}", "НСИ", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private async Task<NsiDeleteSnapshot> SnapshotNsiDeleteAsync(long[] aliasIds, long[] canonicalIdsToDelete)
+    {
+        var blanks = await dbContext.CanonicalBlanks.AsNoTracking()
+            .Where(x => canonicalIdsToDelete.Contains(x.Id))
+            .Select(x => new NsiCanonicalBlankSnapshot(
+                x.Id,
+                x.CanonicalName,
+                x.CanonicalKey,
+                x.BlankType,
+                x.Material,
+                x.MaterialGost,
+                x.ProfileGost,
+                x.DiameterMm,
+                x.WidthMm,
+                x.HeightMm,
+                x.ThicknessMm,
+                x.WallThicknessMm,
+                x.LengthMm,
+                x.BaseUnit,
+                x.I012Status,
+                x.I012Section,
+                x.CreatedAt,
+                x.UpdatedAt,
+                x.IsActive))
+            .ToListAsync();
+        var aliases = await dbContext.BlankAliases.AsNoTracking()
+            .Where(x => aliasIds.Contains(x.Id))
+            .Select(x => new NsiBlankAliasSnapshot(
+                x.Id,
+                x.CanonicalBlankId,
+                x.OneCCode,
+                x.SourceName,
+                x.NormalizedSourceName,
+                x.Source,
+                x.ImportedAt,
+                x.UpdatedAt,
+                x.IsActive))
+            .ToListAsync();
+        var maps = await dbContext.PartBlankMaps.AsNoTracking()
+            .Where(x => canonicalIdsToDelete.Contains(x.CanonicalBlankId))
+            .Select(x => new NsiPartBlankMapSnapshot(
+                x.Id,
+                x.PartId,
+                x.CanonicalBlankId,
+                x.ConsumptionQuantity,
+                x.ConsumptionUnit,
+                x.LossPercent,
+                x.BlankLeadTimeDays,
+                x.Source,
+                x.SourceFile,
+                x.UpdatedAt,
+                x.IsActive,
+                x.IsPrimary))
+            .ToListAsync();
+        var stockLinks = await dbContext.StockItems.AsNoTracking()
+            .Where(x => x.BlankAliasId.HasValue && aliasIds.Contains(x.BlankAliasId.Value))
+            .Select(x => new NsiStockLinkSnapshot(x.Id, x.BlankAliasId))
+            .ToListAsync();
+        var calculationLinks = await dbContext.CalculationItems.AsNoTracking()
+            .Where(x => x.CanonicalBlankId.HasValue && canonicalIdsToDelete.Contains(x.CanonicalBlankId.Value))
+            .Select(x => new NsiCalculationLinkSnapshot(x.Id, x.CanonicalBlankId))
+            .ToListAsync();
+
+        return new NsiDeleteSnapshot(blanks, aliases, maps, stockLinks, calculationLinks);
+    }
+
+    private async Task RestoreNsiDeleteAsync(NsiDeleteSnapshot snapshot)
+    {
+        dbContext.ChangeTracker.Clear();
+        foreach (var saved in snapshot.Blanks)
+        {
+            var blank = await dbContext.CanonicalBlanks.FirstOrDefaultAsync(x => x.Id == saved.Id);
+            if (blank is null)
+            {
+                dbContext.CanonicalBlanks.Add(saved.ToEntity());
             }
             else
             {
-                dbContext.BlankAliases.Remove(alias);
-                deleted++;
+                saved.ApplyTo(blank);
             }
         }
 
         await dbContext.SaveChangesAsync();
-        StatusText = $"Удаление НСИ: удалено {deleted}, перенесено в архив {archived}.";
+
+        foreach (var saved in snapshot.Aliases)
+        {
+            var alias = await dbContext.BlankAliases.FirstOrDefaultAsync(x => x.Id == saved.Id);
+            if (alias is null)
+            {
+                dbContext.BlankAliases.Add(saved.ToEntity());
+            }
+            else
+            {
+                saved.ApplyTo(alias);
+            }
+        }
+
+        await dbContext.SaveChangesAsync();
+
+        foreach (var saved in snapshot.Maps)
+        {
+            var map = await dbContext.PartBlankMaps.FirstOrDefaultAsync(x => x.Id == saved.Id);
+            if (map is null)
+            {
+                dbContext.PartBlankMaps.Add(saved.ToEntity());
+            }
+            else
+            {
+                saved.ApplyTo(map);
+            }
+        }
+
+        foreach (var saved in snapshot.StockLinks)
+        {
+            var stock = await dbContext.StockItems.FirstOrDefaultAsync(x => x.Id == saved.Id);
+            if (stock is not null)
+            {
+                stock.BlankAliasId = saved.BlankAliasId;
+            }
+        }
+
+        foreach (var saved in snapshot.CalculationLinks)
+        {
+            var item = await dbContext.CalculationItems.FirstOrDefaultAsync(x => x.Id == saved.Id);
+            if (item is not null)
+            {
+                item.CanonicalBlankId = saved.CanonicalBlankId;
+            }
+        }
+
+        await dbContext.SaveChangesAsync();
         await LoadAsync();
+        StatusText = $"Восстановлено позиций НСИ: {snapshot.Aliases.Count}.";
     }
 
     private async Task CreateManualNsiBlankAsync()
     {
-        var code = NullIfWhiteSpace(EditOneCCode);
+        var code = NullIfWhiteSpace(NormalizeOneCEditorCode(EditOneCCode));
         var name = NullIfWhiteSpace(EditSourceName);
         if (code is null)
         {
@@ -2056,10 +4010,10 @@ public sealed partial class NormalizationViewModel(
             existingAlias.SourceName = name;
             existingAlias.NormalizedSourceName = NormalizeKey(name);
             existingAlias.UpdatedAt = DateTime.UtcNow;
-            StatusText = $"Позиция НСИ {code} уже была в базе, данные обновлены.";
             await dbContext.SaveChangesAsync();
             await LoadAsync();
             SelectedRow = Rows.FirstOrDefault(x => x.AliasId == existingAlias.Id);
+            StatusText = $"Деталь добавлена в список: {code}.";
             return;
         }
 
@@ -2093,37 +4047,280 @@ public sealed partial class NormalizationViewModel(
         dbContext.CanonicalBlanks.Add(canonical);
         dbContext.BlankAliases.Add(alias);
         await dbContext.SaveChangesAsync();
-        StatusText = $"Добавлена позиция НСИ: {code}.";
         await LoadAsync();
         SelectedRow = Rows.FirstOrDefault(x => x.AliasId == alias.Id);
+        StatusText = $"Деталь добавлена в список: {code}.";
     }
 
-    [RelayCommand]
-    private async Task ArchiveSelectedRowsAsync(object? parameter)
+    private async Task<int> RefreshImportedNamesFromOneCAsync(string sourceFileName, CancellationToken cancellationToken)
     {
-        var rows = GetSelectedNsiRows(parameter).DistinctBy(x => x.AliasId).ToArray();
-        if (rows.Length == 0)
+        if (string.IsNullOrWhiteSpace(sourceFileName))
         {
-            StatusText = "Выберите одну или несколько строк НСИ для переноса в архив.";
-            return;
+            return 0;
         }
 
-        suppressAutoRestoreNsi = true;
-        var aliasIds = rows.Select(x => x.AliasId).Distinct().ToArray();
         var aliases = await dbContext.BlankAliases
-            .Where(x => aliasIds.Contains(x.Id))
-            .ToListAsync();
+            .Include(x => x.CanonicalBlank)
+            .Where(x => x.Source == sourceFileName && x.OneCCode != "")
+            .OrderByDescending(x => x.UpdatedAt)
+            .Take(500)
+            .ToListAsync(cancellationToken);
+        return await RefreshAliasNamesFromOneCAsync(aliases, cancellationToken);
+    }
 
+    private async Task<int> RefreshNsiNamesFromOneCOnOpenAsync(CancellationToken cancellationToken)
+    {
+        if (oneCNamesRefreshAttempted)
+        {
+            return 0;
+        }
+
+        return await RefreshNamesFromOneCAsync(cancellationToken);
+    }
+
+    public async Task<int> RefreshNamesFromOneCAsync(CancellationToken cancellationToken)
+    {
+        oneCNamesRefreshAttempted = true;
+        var aliases = await dbContext.BlankAliases
+            .Include(x => x.CanonicalBlank)
+            .Where(x => x.IsActive && x.OneCCode != "")
+            .OrderByDescending(x => x.UpdatedAt)
+            .Take(500)
+            .ToListAsync(cancellationToken);
+        return await RefreshAliasNamesFromOneCAsync(aliases, cancellationToken);
+    }
+
+    private async Task<int> RefreshAliasNamesFromOneCAsync(IReadOnlyList<BlankAlias> aliases, CancellationToken cancellationToken)
+    {
+        if (aliases.Count == 0)
+        {
+            return 0;
+        }
+
+        IReadOnlyList<OneCNomenclatureItem> items;
+        try
+        {
+            items = await oneCService.ResolveByCodesAsync(aliases.Select(x => x.OneCCode), cancellationToken);
+        }
+        catch
+        {
+            return 0;
+        }
+
+        var itemsByKey = items
+            .SelectMany(item => BuildOneCItemKeys(item).Select(key => (Key: key, Item: item)))
+            .Where(x => !string.IsNullOrWhiteSpace(x.Key))
+            .GroupBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First().Item, StringComparer.OrdinalIgnoreCase);
+        var updated = 0;
         foreach (var alias in aliases)
         {
-            alias.IsActive = false;
+            var aliasKeys = BuildAliasLookupKeys(alias.OneCCode);
+            var item = aliasKeys.Select(key => itemsByKey.GetValueOrDefault(key)).FirstOrDefault(x => x is not null);
+            if (item is null || string.IsNullOrWhiteSpace(item.Name) || string.Equals(alias.SourceName, item.Name, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            alias.SourceName = item.Name.Trim();
+            alias.NormalizedSourceName = NormalizeKey(alias.SourceName);
             alias.UpdatedAt = DateTime.UtcNow;
+            if (alias.CanonicalBlank is not null)
+            {
+                alias.CanonicalBlank.CanonicalName = alias.SourceName;
+                alias.CanonicalBlank.BaseUnit = ParseUnit(item.Unit);
+                alias.CanonicalBlank.UpdatedAt = DateTime.UtcNow;
+            }
+
+            updated++;
         }
 
-        await dbContext.SaveChangesAsync();
-        StatusText = $"Перенесено в архив позиций НСИ: {aliases.Count}.";
-        await LoadAsync();
+        if (updated > 0)
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+
+        return updated;
     }
+
+    private static IEnumerable<string> BuildAliasLookupKeys(string? code)
+    {
+        var text = (code ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            yield break;
+        }
+
+        yield return text;
+        yield return StockCodeNormalizer.NormalizeForComparison(text);
+    }
+
+    private static IEnumerable<string> BuildOneCItemKeys(OneCNomenclatureItem item)
+    {
+        foreach (var value in new[] { item.Code, item.Article })
+        {
+            var text = (value ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                continue;
+            }
+
+            yield return text;
+            yield return StockCodeNormalizer.NormalizeForComparison(text);
+        }
+    }
+
+    private Task<OneCNomenclatureItem?> ShowOneCNomenclatureLookupWindowAsync()
+    {
+        var items = new ObservableCollection<OneCNomenclatureItem>();
+        OneCNomenclatureItem? selected = null;
+        var searchBox = new System.Windows.Controls.TextBox { Width = 360, MinWidth = 320, Text = EditOneCCode };
+        var status = new TextBlock { Text = "Введите УТ-код, IPS или часть наименования.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
+        var grid = new DataGrid
+        {
+            ItemsSource = items,
+            AutoGenerateColumns = false,
+            IsReadOnly = true,
+            SelectionMode = DataGridSelectionMode.Single,
+            Margin = new Thickness(0, 12, 0, 0),
+            MinHeight = 260
+        };
+        grid.Columns.Add(new DataGridTextColumn { Header = "Код 1С", Binding = new System.Windows.Data.Binding(nameof(OneCNomenclatureItem.Code)), Width = 120 });
+        grid.Columns.Add(new DataGridTextColumn { Header = "УТ / артикул", Binding = new System.Windows.Data.Binding(nameof(OneCNomenclatureItem.Article)), Width = 120 });
+        grid.Columns.Add(new DataGridTextColumn { Header = "Наименование", Binding = new System.Windows.Data.Binding(nameof(OneCNomenclatureItem.Name)), Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
+        grid.Columns.Add(new DataGridTextColumn { Header = "Ед.", Binding = new System.Windows.Data.Binding(nameof(OneCNomenclatureItem.Unit)), Width = 90 });
+
+        var searchButton = new System.Windows.Controls.Button { Content = "Найти", MinWidth = 90, Margin = new Thickness(8, 0, 0, 0) };
+        var selectButton = new System.Windows.Controls.Button { Content = "Добавить в НСИ", MinWidth = 150, IsDefault = true };
+        var cancelButton = new System.Windows.Controls.Button { Content = "Отмена", MinWidth = 90, IsCancel = true, Margin = new Thickness(8, 0, 0, 0) };
+        var top = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
+        top.Children.Add(searchBox);
+        top.Children.Add(searchButton);
+        var bottom = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 12, 0, 0) };
+        bottom.Children.Add(selectButton);
+        bottom.Children.Add(cancelButton);
+        var root = new DockPanel { Margin = new Thickness(16) };
+        DockPanel.SetDock(top, Dock.Top);
+        DockPanel.SetDock(status, Dock.Top);
+        DockPanel.SetDock(bottom, Dock.Bottom);
+        root.Children.Add(top);
+        root.Children.Add(status);
+        root.Children.Add(bottom);
+        root.Children.Add(grid);
+        var window = new Window
+        {
+            Title = "Добавить НСИ из 1С",
+            Content = root,
+            Width = 860,
+            Height = 520,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = Application.Current.Windows.OfType<Window>().FirstOrDefault(x => x.IsActive)
+        };
+
+        async Task SearchAsync()
+        {
+            var query = searchBox.Text.Trim();
+            selected = null;
+            grid.SelectedItem = null;
+            items.Clear();
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                status.Text = "Введите УТ-код, IPS или часть наименования.";
+                return;
+            }
+
+            status.Text = "Поиск в 1С...";
+            try
+            {
+                var oneCQuery = BuildOneCSearchQuery(query);
+                var result = await oneCService.SearchAsync(oneCQuery, 80, CancellationToken.None);
+                if (result.Count == 0 && !string.Equals(oneCQuery, query, StringComparison.Ordinal))
+                {
+                    result = await oneCService.SearchAsync(query, 80, CancellationToken.None);
+                }
+
+                foreach (var item in result)
+                {
+                    items.Add(item);
+                }
+
+                status.Text = items.Count == 0 ? "Позиции в 1С не найдены." : $"Найдено позиций: {items.Count}. Выберите нужную строку.";
+            }
+            catch (Exception ex)
+            {
+                status.Text = $"Не удалось выполнить поиск в 1С: {ex.GetBaseException().Message}";
+            }
+        }
+
+        searchButton.Click += async (_, _) => await SearchAsync();
+        searchBox.KeyDown += async (_, args) =>
+        {
+            if (args.Key == System.Windows.Input.Key.Enter)
+            {
+                args.Handled = true;
+                await SearchAsync();
+            }
+        };
+        grid.MouseDoubleClick += (_, _) =>
+        {
+            if (grid.SelectedItem is OneCNomenclatureItem item)
+            {
+                selected = item;
+                window.DialogResult = true;
+            }
+        };
+        selectButton.Click += (_, _) =>
+        {
+            if (grid.SelectedItem is OneCNomenclatureItem item)
+            {
+                selected = item;
+                window.DialogResult = true;
+            }
+            else
+            {
+                status.Text = "Выберите позицию из списка.";
+            }
+        };
+
+        _ = SearchAsync();
+        window.ShowDialog();
+        return Task.FromResult(selected);
+    }
+
+    private static string NormalizeOneCEditorCode(string value)
+    {
+        var code = UiText.Clean(value).Trim();
+        if (code.Length == 11 && code.All(char.IsDigit))
+        {
+            var ips = code.TrimStart('0');
+            return ips.Length == 0 ? "0" : ips;
+        }
+
+        return code;
+    }
+
+    private static string BuildOneCSearchQuery(string value)
+    {
+        var query = UiText.Clean(value).Trim();
+        if (LooksLikeCodeSearch(query) && !query.Any(char.IsWhiteSpace))
+        {
+            return UiSearchText.Normalize(query);
+        }
+
+        return NormalizeOneCTextSearchQuery(query);
+    }
+
+    private static string NormalizeOneCTextSearchQuery(string value)
+    {
+        var text = Regex.Replace(value, @"(?<![\p{L}\p{N}])[Дд]\s*(?=\d)", "D", RegexOptions.CultureInvariant);
+        text = Regex.Replace(text, @"(?<=\d)\s*[ХхXx]\s*(?=\d)", "x", RegexOptions.CultureInvariant);
+        return text;
+    }
+
+    private static bool LooksLikeCodeSearch(string value) =>
+        value.Any(char.IsDigit) ||
+        value.Any(ch => ch is '-' or '.' or '_' or '/' or '\\') ||
+        value.Any(ch => ch is >= 'A' and <= 'Z' or >= 'a' and <= 'z');
 
     private IEnumerable<NsiBlankRow> GetSelectedNsiRows(object? parameter)
     {
@@ -2156,102 +4353,16 @@ public sealed partial class NormalizationViewModel(
         }
     }
 
-    private async Task EnsureNsiRowsAvailableAsync()
-    {
-        if (suppressAutoRestoreNsi || await dbContext.BlankAliases.AnyAsync(x => x.IsActive))
-        {
-            return;
-        }
-
-        var inactiveAliases = await dbContext.BlankAliases.Where(x => !x.IsActive).ToListAsync();
-        if (inactiveAliases.Count > 0)
-        {
-            foreach (var alias in inactiveAliases)
-            {
-                alias.IsActive = true;
-                alias.UpdatedAt = DateTime.UtcNow;
-            }
-
-            StatusText = $"Восстановлено позиций НСИ из архива: {inactiveAliases.Count}.";
-            await dbContext.SaveChangesAsync();
-            return;
-        }
-
-        var latestSnapshotId = await dbContext.StockSnapshots.AsNoTracking()
-            .OrderByDescending(x => x.SnapshotDate)
-            .ThenByDescending(x => x.ImportedAt)
-            .Select(x => (long?)x.Id)
-            .FirstOrDefaultAsync();
-        if (latestSnapshotId is null)
-        {
-            return;
-        }
-
-        var stockItems = await dbContext.StockItems.AsNoTracking()
-            .Where(x => x.StockSnapshotId == latestSnapshotId.Value && x.OneCCode != "" && x.SourceName != "")
-            .OrderBy(x => x.OneCCode)
-            .ToListAsync();
-        var restored = 0;
-        foreach (var stock in stockItems.GroupBy(x => x.OneCCode, StringComparer.OrdinalIgnoreCase).Select(x => x.First()))
-        {
-            var code = stock.OneCCode.Trim();
-            var name = stock.SourceName.Trim();
-            if (string.IsNullOrWhiteSpace(code) || string.IsNullOrWhiteSpace(name))
-            {
-                continue;
-            }
-
-            var canonicalKey = $"stock:{code.ToUpperInvariant()}";
-            var canonical = await dbContext.CanonicalBlanks.FirstOrDefaultAsync(x => x.CanonicalKey == canonicalKey);
-            if (canonical is null)
-            {
-                canonical = new CanonicalBlank
-                {
-                    CanonicalName = name,
-                    CanonicalKey = canonicalKey,
-                    BlankType = BlankType.Unknown,
-                    BaseUnit = stock.Unit
-                };
-                dbContext.CanonicalBlanks.Add(canonical);
-            }
-
-            dbContext.BlankAliases.Add(new BlankAlias
-            {
-                CanonicalBlank = canonical,
-                OneCCode = code,
-                SourceName = name,
-                NormalizedSourceName = NormalizeKey(name),
-                Source = "Восстановлено из остатков"
-            });
-            restored++;
-        }
-
-        if (restored > 0)
-        {
-            StatusText = $"Восстановлено позиций НСИ из последнего снимка остатков: {restored}.";
-            await dbContext.SaveChangesAsync();
-        }
-    }
+    private static Task EnsureNsiRowsAvailableAsync() => Task.CompletedTask;
     [RelayCommand]
     public async Task LoadAsync()
     {
         await EnsureNsiRowsAvailableAsync();
+        var refreshedFromOneC = await RefreshNsiNamesFromOneCOnOpenAsync(CancellationToken.None);
 
         var query = dbContext.BlankAliases.AsNoTracking()
             .Include(x => x.CanonicalBlank)
             .Where(x => x.IsActive);
-
-        if (!string.IsNullOrWhiteSpace(Search))
-        {
-            var searchValue = Search.Trim();
-            query = query.Where(x =>
-                x.OneCCode.Contains(searchValue) ||
-                x.SourceName.Contains(searchValue) ||
-                x.NormalizedSourceName.Contains(searchValue) ||
-                (x.CanonicalBlank != null && (
-                    x.CanonicalBlank.CanonicalName.Contains(searchValue) ||
-                    (x.CanonicalBlank.Material != null && x.CanonicalBlank.Material.Contains(searchValue)))));
-        }
 
         if (SelectedBlankTypeFilter.Value is not null)
         {
@@ -2259,15 +4370,7 @@ public sealed partial class NormalizationViewModel(
             query = query.Where(x => x.CanonicalBlank != null && x.CanonicalBlank.BlankType == blankType);
         }
 
-        if (!string.IsNullOrWhiteSpace(MaterialFilter))
-        {
-            var material = MaterialFilter.Trim();
-            query = query.Where(x =>
-                (x.CanonicalBlank != null && x.CanonicalBlank.Material != null && x.CanonicalBlank.Material.Contains(material)) ||
-                x.SourceName.Contains(material) ||
-                x.NormalizedSourceName.Contains(material));
-        }
-
+        string? textSizeFilter = null;
         if (!string.IsNullOrWhiteSpace(SizeFilter))
         {
             var sizeText = SizeFilter.Trim();
@@ -2285,27 +4388,55 @@ public sealed partial class NormalizationViewModel(
             }
             else
             {
-                query = query.Where(x =>
-                    x.SourceName.Contains(sizeText) ||
-                    x.NormalizedSourceName.Contains(sizeText) ||
-                    (x.CanonicalBlank != null && x.CanonicalBlank.CanonicalName.Contains(sizeText)));
+                textSizeFilter = sizeText;
             }
-        }
-
-        if (DuplicatesOnly)
-        {
-            var duplicateNames = await dbContext.BlankAliases.AsNoTracking()
-                .Where(x => x.IsActive && x.CanonicalBlank != null && x.CanonicalBlank.IsActive && x.NormalizedSourceName != "")
-                .GroupBy(x => x.NormalizedSourceName)
-                .Where(g => g.Count() > 1)
-                .Select(g => g.Key)
-                .ToListAsync();
-            query = query.Where(x => duplicateNames.Contains(x.NormalizedSourceName));
         }
 
         var aliases = await query
             .OrderBy(x => x.OneCCode)
             .ToListAsync();
+        var duplicateKeys = aliases
+            .Select(x => NsiDuplicateKey.Build(x.CanonicalBlank, x))
+            .Where(x => x.Length > 0)
+            .GroupBy(x => x, StringComparer.Ordinal)
+            .Where(x => x.Count() > 1)
+            .Select(x => x.Key)
+            .ToHashSet(StringComparer.Ordinal);
+        var duplicateGroupCount = duplicateKeys.Count;
+        if (DuplicatesOnly)
+        {
+            aliases = aliases
+                .Where(x => duplicateKeys.Contains(NsiDuplicateKey.Build(x.CanonicalBlank, x)))
+                .OrderBy(x => NsiDuplicateKey.Build(x.CanonicalBlank, x), StringComparer.Ordinal)
+                .ThenBy(x => x.OneCCode, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        var searchValue = Search.Trim();
+        var materialFilter = MaterialFilter.Trim();
+        if (!string.IsNullOrWhiteSpace(searchValue))
+        {
+            aliases = aliases.Where(x => NsiAliasMatchesSearch(x, searchValue)).ToList();
+        }
+
+        if (!string.IsNullOrWhiteSpace(materialFilter))
+        {
+            aliases = aliases
+                .Where(x =>
+                    UiSearchText.Contains(x.CanonicalBlank?.Material, materialFilter) ||
+                    UiSearchText.Contains(x.SourceName, materialFilter) ||
+                    UiSearchText.Contains(x.NormalizedSourceName, materialFilter))
+                .ToList();
+        }
+
+        if (!string.IsNullOrWhiteSpace(textSizeFilter))
+        {
+            aliases = aliases
+                .Where(x =>
+                    UiSearchText.Contains(x.SourceName, textSizeFilter) ||
+                    UiSearchText.Contains(x.NormalizedSourceName, textSizeFilter) ||
+                    UiSearchText.Contains(x.CanonicalBlank?.CanonicalName, textSizeFilter))
+                .ToList();
+        }
 
         var latestSnapshotId = await dbContext.StockSnapshots.AsNoTracking()
             .OrderByDescending(x => x.SnapshotDate)
@@ -2333,6 +4464,8 @@ public sealed partial class NormalizationViewModel(
                 x => (Quantity: x.Sum(i => i.Quantity), Unit: x.Select(i => i.Unit).FirstOrDefault()),
                 StringComparer.OrdinalIgnoreCase);
 
+        var pricesByCode = await LoadOneCPricesByCodeAsync(aliases);
+
         Rows.Clear();
         foreach (var alias in aliases)
         {
@@ -2343,6 +4476,7 @@ public sealed partial class NormalizationViewModel(
             var stockCodeKey = StockCodeNormalizer.NormalizeForComparison(alias.OneCCode);
             var hasCmoStock = cmoStockByCode.TryGetValue(stockCodeKey, out var cmoStock);
             var hasWarehouseStock = warehouseStockByCode.TryGetValue(stockCodeKey, out var warehouseStock);
+            pricesByCode.TryGetValue(stockCodeKey, out var price);
             Rows.Add(new NsiBlankRow(
                 alias.Id,
                 alias.CanonicalBlankId,
@@ -2351,25 +4485,195 @@ public sealed partial class NormalizationViewModel(
                 DisplayUnit(unit),
                 blank is null ? "Не распознано" : DisplayBlankType(blank.BlankType),
                 FormatSize(blank),
+                duplicateKeys.Contains(NsiDuplicateKey.Build(blank, alias)) ? BuildDuplicateDisplayKey(blank, alias) : string.Empty,
                 UiText.Clean(blank?.Material),
                 UiText.Clean(blank?.MaterialGost),
                 UiText.Clean(blank?.ProfileGost),
-                hasCmoStock ? FormatDecimal(cmoStock.Quantity) : "0",
-                hasWarehouseStock ? FormatDecimal(warehouseStock.Quantity) : "0",
-                hasCmoStock ? DisplayUnit(cmoStock.Unit) : hasWarehouseStock ? DisplayUnit(warehouseStock.Unit) : string.Empty,
+                hasCmoStock ? FormatStockQuantity(cmoStock.Quantity, cmoStock.Unit) : "0",
+                hasWarehouseStock ? FormatStockQuantity(warehouseStock.Quantity, warehouseStock.Unit) : "0",
+                hasCmoStock ? DisplayStockUnit(cmoStock.Unit) : hasWarehouseStock ? DisplayStockUnit(warehouseStock.Unit) : string.Empty,
+                FormatPrice(price),
                 UiText.Clean(alias.SourceName),
                 UiText.Clean(alias.Source),
                 alias.UpdatedAt.ToLocalTime().ToString("g")));
         }
 
-        SummaryText = $"Строк НСИ: {Rows.Count}";
-        StatusText = $"Показано позиций НСИ: {Rows.Count}";
+        SummaryText = DuplicatesOnly
+            ? $"Строк НСИ: {Rows.Count}; групп дублей: {duplicateGroupCount}"
+            : $"Строк НСИ: {Rows.Count}";
+        StatusText = refreshedFromOneC > 0
+            ? $"Показано позиций НСИ: {Rows.Count}; наименований обновлено из 1С: {refreshedFromOneC}."
+            : DuplicatesOnly
+                ? $"Показано дублей НСИ: {Rows.Count}; групп дублей: {duplicateGroupCount}. Строки сгруппированы по сходимости."
+                : $"Показано позиций НСИ: {Rows.Count}";
         if (SelectedRow is not null && Rows.All(x => x.AliasId != SelectedRow.AliasId))
         {
             SelectedRow = null;
         }
 
         await LoadMaterialSuggestionsAsync(EditMaterial);
+        await LoadMaterialGostSuggestionsAsync(EditMaterialGost);
+        await LoadProfileGostSuggestionsAsync(EditProfileGost);
+    }
+
+    public async Task<int> RefreshPricesFromOneCAsync(CancellationToken cancellationToken)
+    {
+        var codes = await dbContext.BlankAliases.AsNoTracking()
+            .Where(x => x.IsActive && x.OneCCode != string.Empty)
+            .Select(x => x.OneCCode)
+            .Distinct()
+            .ToListAsync(cancellationToken);
+        var requestedKeys = codes
+            .Select(StockCodeNormalizer.NormalizeForComparison)
+            .Where(x => x.Length > 0)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (requestedKeys.Count == 0)
+        {
+            return 0;
+        }
+
+        var pricesByKey = new Dictionary<string, OneCNomenclaturePrice>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var chunk in codes.Chunk(500))
+            {
+                var prices = await oneCService.ResolvePricesByCodesAsync(chunk, cancellationToken);
+                foreach (var price in prices.Where(x => x.Price > 0))
+                {
+                    foreach (var key in BuildOneCPriceKeys(price).Select(StockCodeNormalizer.NormalizeForComparison).Where(x => x.Length > 0))
+                    {
+                        if (!pricesByKey.TryGetValue(key, out var current) ||
+                            IsPreferredPriceType(price.PriceType) && !IsPreferredPriceType(current.PriceType) ||
+                            IsPreferredPriceType(price.PriceType) == IsPreferredPriceType(current.PriceType) && price.Price > current.Price)
+                        {
+                            pricesByKey[key] = price;
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            return 0;
+        }
+
+        var now = DateTime.UtcNow;
+        var relevantKeys = requestedKeys.Concat(pricesByKey.Keys).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var existing = await dbContext.OneCPriceItems
+            .Where(x => relevantKeys.Contains(x.LookupKey))
+            .ToDictionaryAsync(x => x.LookupKey, StringComparer.OrdinalIgnoreCase, cancellationToken);
+
+        var changed = 0;
+        foreach (var key in requestedKeys)
+        {
+            if (!pricesByKey.ContainsKey(key) && existing.TryGetValue(key, out var stale))
+            {
+                dbContext.OneCPriceItems.Remove(stale);
+                changed++;
+            }
+        }
+
+        foreach (var (key, price) in pricesByKey)
+        {
+            if (!existing.TryGetValue(key, out var item))
+            {
+                dbContext.OneCPriceItems.Add(new OneCPriceItem
+                {
+                    LookupKey = key,
+                    Code = price.Code,
+                    Article = price.Article,
+                    Price = price.Price,
+                    Currency = price.Currency,
+                    PriceType = price.PriceType,
+                    SyncedAt = now
+                });
+                changed++;
+                continue;
+            }
+
+            if (item.Code != price.Code ||
+                item.Article != price.Article ||
+                item.Price != price.Price ||
+                item.Currency != price.Currency ||
+                item.PriceType != price.PriceType)
+            {
+                changed++;
+            }
+
+            item.Code = price.Code;
+            item.Article = price.Article;
+            item.Price = price.Price;
+            item.Currency = price.Currency;
+            item.PriceType = price.PriceType;
+            item.SyncedAt = now;
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return changed;
+    }
+
+    private async Task<Dictionary<string, OneCPriceItem>> LoadOneCPricesByCodeAsync(IReadOnlyList<BlankAlias> aliases)
+    {
+        var codes = aliases
+            .Select(x => x.OneCCode)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(StockCodeNormalizer.NormalizeForComparison)
+            .Where(x => x.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (codes.Length == 0)
+        {
+            return new Dictionary<string, OneCPriceItem>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var items = await dbContext.OneCPriceItems.AsNoTracking()
+            .Where(x => codes.Contains(x.LookupKey))
+            .ToListAsync();
+        return items
+            .GroupBy(x => x.LookupKey, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.OrderByDescending(p => p.SyncedAt).First(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static IEnumerable<string> BuildOneCPriceKeys(OneCNomenclaturePrice price)
+    {
+        if (!string.IsNullOrWhiteSpace(price.Code))
+        {
+            yield return price.Code;
+        }
+
+        if (!string.IsNullOrWhiteSpace(price.Article))
+        {
+            yield return price.Article;
+        }
+    }
+
+    private static string FormatPrice(OneCPriceItem? price)
+    {
+        if (price is null || price.Price <= 0)
+        {
+            return string.Empty;
+        }
+
+        var currency = FormatCurrency(price.Currency);
+        var amount = FormatDecimal(price.Price);
+        return string.IsNullOrWhiteSpace(currency) ? amount : $"{amount} {currency}";
+    }
+
+    private static bool IsPreferredPriceType(string? value) =>
+        UiText.Clean(value).Contains("Стоимость", StringComparison.OrdinalIgnoreCase);
+
+    private static string FormatCurrency(string? currency)
+    {
+        var value = UiText.Clean(currency).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var upper = value.ToUpperInvariant();
+        return upper is "RUB" or "RUR" or "643" || upper.Contains("РУБ", StringComparison.Ordinal)
+            ? "₽"
+            : value;
     }
 
     [RelayCommand]
@@ -2454,8 +4758,32 @@ public sealed partial class NormalizationViewModel(
         return string.Join(" ", parts);
     }
 
+    private static string BuildDuplicateDisplayKey(CanonicalBlank? blank, BlankAlias alias)
+    {
+        if (blank is null)
+        {
+            return string.Empty;
+        }
+
+        var size = FormatSize(blank);
+        var physicalPart = string.IsNullOrWhiteSpace(size)
+            ? UiText.Clean(alias.SourceName)
+            : size;
+        return string.Join(" | ", new[]
+            {
+                DisplayBlankType(blank.BlankType),
+                DisplayUnit(MeterBasedBlankTypes.Contains(blank.BlankType) ? MeasurementUnit.Meter : blank.BaseUnit),
+                UiText.Clean(blank.Material),
+                UiText.Clean(blank.MaterialGost),
+                UiText.Clean(blank.ProfileGost),
+                physicalPart
+            }
+            .Where(x => !string.IsNullOrWhiteSpace(x)));
+    }
+
     private void LoadSelectedEditor(NsiBlankRow? row)
     {
+        suppressNsiEditorAutoDefaults = true;
         if (row is null)
         {
             EditBlankType = BlankTypes.First(x => x.Value == BlankType.Unknown);
@@ -2463,6 +4791,9 @@ public sealed partial class NormalizationViewModel(
             EditSize = string.Empty;
             EditMaterialGost = string.Empty;
             EditProfileGost = string.Empty;
+            lastAutoMaterialGost = null;
+            lastAutoProfileGost = null;
+            suppressNsiEditorAutoDefaults = false;
             return;
         }
 
@@ -2474,6 +4805,9 @@ public sealed partial class NormalizationViewModel(
         EditSize = row.Size;
         EditMaterialGost = row.MaterialGost;
         EditProfileGost = row.ProfileGost;
+        lastAutoMaterialGost = null;
+        lastAutoProfileGost = null;
+        suppressNsiEditorAutoDefaults = false;
     }
 
     private static bool TryApplySize(string? value, CanonicalBlank blank, out string error)
@@ -2607,6 +4941,25 @@ public sealed partial class NormalizationViewModel(
         decimal.Parse(value.Replace(',', '.'), NumberStyles.Number, CultureInfo.InvariantCulture);
 
     private static string? NullIfWhiteSpace(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+    private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))?.Trim() ?? string.Empty;
+
+    private static MeasurementUnit ParseUnit(string? value)
+    {
+        var text = UiText.Clean(value).ToUpperInvariant();
+        if ((text.Contains("ПОГ", StringComparison.Ordinal) || text.Contains("М", StringComparison.Ordinal) || text.Contains("M", StringComparison.Ordinal)) &&
+            !text.Contains("ММ", StringComparison.Ordinal) &&
+            !text.Contains("MM", StringComparison.Ordinal))
+        {
+            return MeasurementUnit.Meter;
+        }
+
+        if (text.Contains("КГ", StringComparison.Ordinal) || text.Contains("KG", StringComparison.Ordinal))
+        {
+            return MeasurementUnit.Kilogram;
+        }
+
+        return MeasurementUnit.Piece;
+    }
 
     private static bool IsUsageMatch(PartBlankMap map, NsiBlankRow row)
     {
@@ -2623,6 +4976,15 @@ public sealed partial class NormalizationViewModel(
         .Replace("С…", "X", StringComparison.Ordinal)
         .Replace("×", "X", StringComparison.Ordinal);
 
+    private static bool NsiAliasMatchesSearch(BlankAlias alias, string searchValue) =>
+        UiSearchText.Contains(alias.OneCCode, searchValue) ||
+        UiSearchText.Contains(alias.SourceName, searchValue) ||
+        UiSearchText.Contains(alias.NormalizedSourceName, searchValue) ||
+        UiSearchText.Contains(alias.CanonicalBlank?.CanonicalName, searchValue) ||
+        UiSearchText.Contains(alias.CanonicalBlank?.Material, searchValue) ||
+        UiSearchText.Contains(alias.CanonicalBlank?.MaterialGost, searchValue) ||
+        UiSearchText.Contains(alias.CanonicalBlank?.ProfileGost, searchValue);
+
     private static string FormatDecimal(decimal? quantity) => quantity is null ? string.Empty : quantity.Value.ToString("0.####", CultureInfo.GetCultureInfo("ru-RU"));
     private static bool TryParseQuantity(string? value, out decimal quantity)
     {
@@ -2638,6 +5000,12 @@ public sealed partial class NormalizationViewModel(
         _ => unit.ToString()
     };
 
+    private static string FormatStockQuantity(decimal quantity, MeasurementUnit unit) =>
+        FormatDecimal(unit == MeasurementUnit.Meter ? quantity * 1000m : quantity);
+
+    private static string DisplayStockUnit(MeasurementUnit unit) =>
+        unit == MeasurementUnit.Meter ? "мм" : DisplayUnit(unit);
+
     private static string DisplayBlankType(BlankType type) => type switch
     {
         BlankType.RoundBar => "Круг",
@@ -2652,7 +5020,7 @@ public sealed partial class NormalizationViewModel(
         BlankType.IBeam => "Двутавр",
         BlankType.BronzeBar => "Пруток бронзовый",
         BlankType.BronzeSheet => "Лист бронзовый",
-        BlankType.WeldingElement => "Сварочный элемент",
+        BlankType.WeldingElement => "Сварное изделие",
         BlankType.Purchased => "Покупная",
         BlankType.Casting => "Литье",
         BlankType.Forging => "Поковка",
@@ -2696,10 +5064,20 @@ public sealed partial class StockViewModel(BlankDemandPlannerDbContext dbContext
         if (!string.IsNullOrWhiteSpace(Search))
         {
             var searchValue = Search.Trim();
-            query = query.Where(x =>
-                x.OneCCode.Contains(searchValue) ||
-                x.SourceName.Contains(searchValue) ||
-                (x.Warehouse != null && x.Warehouse.Contains(searchValue)));
+            var searchedItems = await query
+                .OrderBy(x => x.OneCCode)
+                .Take(10000)
+                .ToListAsync();
+            searchedItems = searchedItems
+                .Where(x =>
+                    UiSearchText.Contains(x.OneCCode, searchValue) ||
+                    UiSearchText.Contains(x.SourceName, searchValue) ||
+                    UiSearchText.Contains(x.Warehouse, searchValue))
+                .Take(2000)
+                .ToList();
+
+            AddRows(searchedItems, snapshot.SourceFile);
+            return;
         }
 
         var items = await query
@@ -2707,6 +5085,11 @@ public sealed partial class StockViewModel(BlankDemandPlannerDbContext dbContext
             .Take(2000)
             .ToListAsync();
 
+        AddRows(items, snapshot.SourceFile);
+    }
+
+    private void AddRows(IEnumerable<StockItem> items, string? sourceFile)
+    {
         foreach (var item in items)
         {
             Rows.Add(new StockRow(
@@ -2717,7 +5100,7 @@ public sealed partial class StockViewModel(BlankDemandPlannerDbContext dbContext
                 UiText.Clean(item.Warehouse)));
         }
 
-        StatusText = $"Показано остатков: {Rows.Count}; источник: {Path.GetFileName(snapshot.SourceFile ?? string.Empty)}";
+        StatusText = $"Показано остатков: {Rows.Count}; источник: {Path.GetFileName(sourceFile ?? string.Empty)}";
     }
 
     private static string FormatDecimal(decimal quantity) => quantity.ToString("0.####", CultureInfo.GetCultureInfo("ru-RU"));
@@ -2727,29 +5110,56 @@ public sealed partial class MskViewModel(
     BlankDemandPlannerDbContext dbContext,
     ILogger logger,
     IIpsDrawingService? ipsDrawingService = null,
+    IOneCProductionLaunchService? oneCProductionLaunchService = null,
+    IOneCGoodsTransferService? oneCGoodsTransferService = null,
     bool autoOpenDrawings = false) : ObservableObject
 {
+    private const decimal ProductionLaunchMeterCutWidth = 0.005m;
+
     private const string DefaultMskFolder = @"X:\19_МЕХ УЧАСТОК\База МСК\СПИСОК МСК";
 
     private readonly List<MskLibraryRow> allRows = [];
     private readonly IIpsDrawingService drawingService = ipsDrawingService ?? new IpsBridgeDrawingService();
     private readonly HashSet<string> attemptedDrawingIps = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> demandIps = new(StringComparer.OrdinalIgnoreCase);
+    private int detailMetricsVersion;
 
     public ObservableCollection<MskLibraryRow> Rows { get; } = [];
 
     [ObservableProperty] private string search = string.Empty;
+    [ObservableProperty] private bool demandOnly;
     [ObservableProperty] private string statusText = "МСК не загружены.";
     [ObservableProperty] private MskLibraryRow? selectedRow;
     [ObservableProperty] private string detailText = "Выберите деталь для просмотра МСК.";
+    [ObservableProperty] private string detailMetricsText = "Выберите деталь для расчета потребности и запуска.";
+    [ObservableProperty] private Uri? drawingViewerSource;
+    [ObservableProperty] private string drawingStatusText = "PDF-чертеж не выбран.";
     [ObservableProperty] private bool isBusy;
+    [ObservableProperty] private bool isDrawingBusy;
+    [ObservableProperty] private string productionLaunchStatusText = "Запуск в производство не выполнялся.";
 
     partial void OnSearchChanged(string value) => ApplyFilter();
+    partial void OnDemandOnlyChanged(bool value) => ApplyFilter();
 
     partial void OnSelectedRowChanged(MskLibraryRow? value)
     {
         DetailText = value is null
             ? "Выберите деталь для просмотра МСК."
             : BuildDetailText(value);
+        DetailMetricsText = value is null
+            ? "Выберите деталь для расчета потребности и запуска."
+            : "Расчет показателей...";
+        _ = LoadDetailMetricsAsync(value, Interlocked.Increment(ref detailMetricsVersion));
+        if (value is null)
+        {
+            DrawingViewerSource = null;
+            DrawingStatusText = "PDF-чертеж не выбран.";
+        }
+        else if (!autoOpenDrawings && DrawingViewerSource is null)
+        {
+            DrawingStatusText = "PDF-чертеж не открыт. Кликните строку МСК, чтобы открыть чертеж.";
+        }
+
         if (value is not null && autoOpenDrawings)
         {
             _ = TryOpenDrawingAsync(value, forceRetry: false);
@@ -2791,7 +5201,7 @@ public sealed partial class MskViewModel(
                 try
                 {
                     var record = ReadMskRecord(file);
-                    if (!string.IsNullOrWhiteSpace(record.Ips))
+                    if (IsValidMskLibraryIps(record.Ips))
                     {
                         records.Add(record);
                     }
@@ -2814,22 +5224,119 @@ public sealed partial class MskViewModel(
 
             dbContext.MskRecords.AddRange(latestByIps);
 
+            var removedInvalidLibraryParts = await RemoveInvalidMskLibraryPartsAsync();
             var parts = await dbContext.Parts.ToListAsync();
             var mskIps = latestByIps.Select(x => x.Ips).ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var part in parts)
             {
-                part.HasMsk = mskIps.Contains(part.Ips);
+                part.HasMsk = IsValidMskLibraryIps(part.Ips) && mskIps.Contains(part.Ips);
                 part.UpdatedAt = DateTime.UtcNow;
             }
+            var addedLibraryParts = await AddMissingLibraryPartsFromMskAsync(latestByIps);
 
             await dbContext.SaveChangesAsync();
             await LoadFromDatabaseAsync();
-            StatusText = $"МСК обновлены из X: файлов {files.Count}, записей {latestByIps.Count}, ошибок чтения {errors}.";
+            StatusText = $"МСК обновлены из X: файлов {files.Count}, записей {latestByIps.Count}, ошибок чтения {errors}; добавлено в библиотеку: {addedLibraryParts}; убрано неверных: {removedInvalidLibraryParts}.";
+            if (addedLibraryParts > 0)
+            {
+                MessageBox.Show($"При обновлении МСК добавлено новых деталей в библиотеку: {addedLibraryParts}.", "Планирование", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
         }
         finally
         {
             IsBusy = false;
         }
+    }
+
+    public async Task<int> AddMissingLibraryPartsFromMskAsync(IReadOnlyList<MskRecord>? records = null, IReadOnlyDictionary<string, MskCsvDetail>? details = null)
+    {
+        records ??= await dbContext.MskRecords.AsNoTracking().ToListAsync();
+        var latestByIps = records
+            .Where(x => IsValidMskLibraryIps(x.Ips))
+            .GroupBy(x => x.Ips, StringComparer.OrdinalIgnoreCase)
+            .Select(x => x.OrderByDescending(r => r.ImportedAt).First())
+            .ToList();
+        if (latestByIps.Count == 0)
+        {
+            return 0;
+        }
+
+        var existingParts = await dbContext.Parts
+            .Include(x => x.BlankMaps.Where(m => m.IsActive))
+            .ToListAsync();
+        var partsByIps = existingParts
+            .GroupBy(x => x.Ips, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.OrderByDescending(p => p.UpdatedAt).First(), StringComparer.OrdinalIgnoreCase);
+        var mskDetails = details ?? LoadMskDetailsFromReport();
+        var added = 0;
+        foreach (var record in latestByIps)
+        {
+            var detail = ResolveMskDetail(record, mskDetails);
+            if (partsByIps.TryGetValue(record.Ips, out var existingPart))
+            {
+                existingPart.HasMsk = true;
+                if (IsArchivedLibrarySource(existingPart.Source))
+                {
+                    existingPart.Source = "МСК";
+                    existingPart.Designation = FirstNotEmpty(record.Designation, existingPart.Designation);
+                    existingPart.Name = FirstNotEmpty(record.Name, existingPart.Name, record.Ips);
+                    existingPart.UpdatedAt = DateTime.UtcNow;
+                    added++;
+                }
+
+                if (!existingPart.BlankMaps.Any(x => x.IsActive))
+                {
+                    await TryAttachMskBlankAsync(existingPart, detail);
+                }
+
+                continue;
+            }
+
+            var (designation, name) = SplitDesignationAndName(FirstNotEmpty(record.Name, record.Ips));
+            var part = new Part
+            {
+                Ips = record.Ips.Trim(),
+                Designation = FirstNotEmpty(record.Designation, designation),
+                Name = FirstNotEmpty(name, record.Name, record.Ips),
+                HasMsk = true,
+                Source = "МСК"
+            };
+            dbContext.Parts.Add(part);
+            partsByIps[part.Ips] = part;
+            await TryAttachMskBlankAsync(part, detail);
+            added++;
+        }
+
+        return added;
+    }
+
+    public async Task<int> RemoveInvalidMskLibraryPartsAsync()
+    {
+        var candidates = await dbContext.Parts
+            .Include(x => x.BlankMaps)
+            .Where(x => x.Source == "МСК")
+            .ToListAsync();
+        var invalidParts = candidates
+            .Where(x => !IsValidMskLibraryIps(x.Ips))
+            .ToList();
+        if (invalidParts.Count == 0)
+        {
+            return 0;
+        }
+
+        var invalidIds = invalidParts.Select(x => x.Id).ToHashSet();
+        var demandItems = await dbContext.DemandItems
+            .Where(x => x.PartId != null && invalidIds.Contains(x.PartId.Value))
+            .ToListAsync();
+        foreach (var demandItem in demandItems)
+        {
+            demandItem.PartId = null;
+        }
+
+        dbContext.PartBlankMaps.RemoveRange(invalidParts.SelectMany(x => x.BlankMaps));
+        dbContext.Parts.RemoveRange(invalidParts);
+        await dbContext.SaveChangesAsync();
+        return invalidParts.Count;
     }
 
     [RelayCommand]
@@ -2854,6 +5361,141 @@ public sealed partial class MskViewModel(
     }
 
     [RelayCommand]
+    private async Task LaunchProductionAsync()
+    {
+        var row = SelectedRow ?? ResolveRowFromSearch();
+        if (row is null)
+        {
+            StatusText = "Выберите деталь МСК для запуска в производство.";
+            return;
+        }
+
+        SelectedRow = row;
+        if (oneCProductionLaunchService is null)
+        {
+            MessageBox.Show("Сервис запуска в производство 1С не подключен.", "Планирование", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        ProductionLaunchPreview preview;
+        try
+        {
+            preview = await BuildProductionLaunchPreviewAsync(row);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not build production launch preview for {Ips}", row.Ips);
+            MessageBox.Show($"Не удалось подготовить запуск в производство.\n{ex.GetBaseException().Message}", "Запуск в производство", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        if (preview.MaxQuantity <= 0)
+        {
+            MessageBox.Show($"Материала для запуска детали недостаточно.\nДоступно к запуску: 0\n{preview.MaterialLine}", "Запуск в производство", MessageBoxButton.OK, MessageBoxImage.Information);
+            ProductionLaunchStatusText = "Запуск невозможен: материала недостаточно.";
+            return;
+        }
+
+        var launch = ShowProductionLaunchDialog(preview);
+        if (launch is null)
+        {
+            return;
+        }
+
+        var requests = BuildProductionLaunchRequests(preview, launch.Quantity, launch.Comment, launch.Piecewise);
+        try
+        {
+            IsBusy = true;
+            ProductionLaunchStatusText = launch.Piecewise
+                ? $"Создание комплектаций в 1С: {requests.Count} шт..."
+                : "Создание комплектации в 1С...";
+            var results = new List<OneCProductionLaunchResult>();
+            foreach (var request in requests)
+            {
+                results.Add(await oneCProductionLaunchService.CreateAssemblyAsync(request, CancellationToken.None));
+            }
+
+            var numbers = string.Join(", ", results.Select(x => x.Number).Where(x => !string.IsNullOrWhiteSpace(x)));
+            ProductionLaunchStatusText = launch.Piecewise
+                ? $"Создано комплектаций 1С: {results.Count}; номера: {numbers}."
+                : $"Создана комплектация 1С {results[0].Number}; проведено: {(results[0].Posted ? "да" : "нет")}.";
+            StatusText = ProductionLaunchStatusText;
+            var message = launch.Piecewise
+                ? $"Комплектации 1С созданы.\nДокументов: {results.Count}\nНомера: {numbers}\nКоличество деталей: {FormatDecimal(requests.Sum(x => x.Quantity))}\nДокументы не проведены."
+                : $"Комплектация 1С создана.\nНомер: {results[0].Number}\nКоличество деталей: {FormatDecimal(requests[0].Quantity)}\nДокумент не проведен.\n\nКомментарий:\n{results[0].Comment}";
+            MessageBox.Show(message, "Запуск в производство", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Could not create 1C production launch for {Ips}", row.Ips);
+            ProductionLaunchStatusText = $"Ошибка запуска: {ex.GetBaseException().Message}";
+            MessageBox.Show($"Не удалось создать комплектацию 1С.\n{ex.GetBaseException().Message}", "Запуск в производство", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    [RelayCommand]
+    private async Task ExternalServicesAsync()
+    {
+        if (oneCGoodsTransferService is null)
+        {
+            MessageBox.Show("Сервис перемещения 1С не подключен.", "Услуги на стороне", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        IReadOnlyList<ExternalServiceWipRow> rows;
+        try
+        {
+            rows = await LoadExternalServiceWipRowsAsync();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not load WIP rows for external services");
+            MessageBox.Show($"Не удалось загрузить детали из НЗП.\n{ex.GetBaseException().Message}", "Услуги на стороне", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        if (rows.Count == 0)
+        {
+            MessageBox.Show("В 44 секции НЗП не найдены детали в единице измерения шт.", "Услуги на стороне", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var request = ShowExternalServicesDialog(rows);
+        if (request is null)
+        {
+            return;
+        }
+
+        try
+        {
+            IsBusy = true;
+            ProductionLaunchStatusText = "Создание перемещения 1С для услуг на стороне...";
+            var result = await oneCGoodsTransferService.CreateTransferAsync(request, CancellationToken.None);
+            ProductionLaunchStatusText = $"Создано перемещение 1С {result.Number}; проведено: {(result.Posted ? "да" : "нет")}.";
+            StatusText = ProductionLaunchStatusText;
+            MessageBox.Show(
+                $"Перемещение 1С создано.\nНомер: {result.Number}\nСтрок: {request.Items.Count}\nДокумент не проведен.\n\nКомментарий:\n{result.Comment}",
+                "Услуги на стороне",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Could not create 1C goods transfer for external services");
+            ProductionLaunchStatusText = $"Ошибка перемещения: {ex.GetBaseException().Message}";
+            MessageBox.Show($"Не удалось создать перемещение 1С.\n{ex.GetBaseException().Message}", "Услуги на стороне", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    [RelayCommand]
     private async Task OpenDrawingAsync(object? parameter)
     {
         var row = parameter as MskLibraryRow ?? SelectedRow ?? ResolveRowFromSearch();
@@ -2867,8 +5509,1263 @@ public sealed partial class MskViewModel(
         await TryOpenDrawingAsync(row, forceRetry: true);
     }
 
+    public async Task<ProductionLaunchPreview> BuildProductionLaunchPreviewAsync(MskLibraryRow row)
+    {
+        var part = await dbContext.Parts
+            .Include(x => x.BlankMaps.Where(m => m.IsActive))
+            .ThenInclude(x => x.CanonicalBlank)
+            .ThenInclude(x => x!.Aliases)
+            .AsSplitQuery()
+            .FirstOrDefaultAsync(x => x.Ips == row.Ips);
+        if (part is null)
+        {
+            throw new InvalidOperationException($"Деталь IPS {row.Ips} не найдена в библиотеке.");
+        }
+
+        var map = part.BlankMaps.FirstOrDefault(x => x.IsActive && x.IsPrimary) ?? part.BlankMaps.FirstOrDefault(x => x.IsActive);
+        if (map?.CanonicalBlank is null)
+        {
+            throw new InvalidOperationException($"Для IPS {row.Ips} не задана активная заготовка в библиотеке.");
+        }
+
+        var alias = map.CanonicalBlank.Aliases.FirstOrDefault(x => x.IsActive) ?? map.CanonicalBlank.Aliases.FirstOrDefault();
+        if (alias is null || string.IsNullOrWhiteSpace(alias.OneCCode))
+        {
+            throw new InvalidOperationException($"Для заготовки IPS {row.Ips} не найден УТ-код 1С.");
+        }
+
+        var snapshot = await dbContext.StockSnapshots
+            .AsNoTracking()
+            .OrderByDescending(x => x.ImportedAt)
+            .ThenByDescending(x => x.Id)
+            .FirstOrDefaultAsync();
+        if (snapshot is null)
+        {
+            throw new InvalidOperationException("Нет снимка остатков 1С. Нажмите \"Обновить данные 1С\".");
+        }
+
+        var stockItems = await dbContext.StockItems
+            .AsNoTracking()
+            .Where(x => x.StockSnapshotId == snapshot.Id)
+            .ToListAsync();
+        var blankCodeKey = StockCodeNormalizer.NormalizeForComparison(alias.OneCCode);
+        var materialStock = stockItems
+            .Where(x =>
+                StockWarehouseRules.IsProductionLaunchMaterialWarehouse(x.Warehouse) &&
+                StockCodeNormalizer.NormalizeForComparison(x.OneCCode) == blankCodeKey &&
+                x.Unit == map.ConsumptionUnit)
+            .Sum(x => x.Quantity);
+        var consumption = map.ConsumptionQuantity <= 0 ? 0m : map.ConsumptionQuantity;
+        var maxQuantity = CalculateProductionLaunchMaxQuantity(map.ConsumptionUnit, consumption, materialStock);
+        var shortageRows = await BuildDemandShortageRowsAsync(row.Ips, stockItems);
+        var defaultQuantity = Math.Min(maxQuantity, Math.Max(1m, decimal.Floor(shortageRows.Sum(x => x.Quantity))));
+        if (defaultQuantity <= 0)
+        {
+            defaultQuantity = maxQuantity;
+        }
+
+        var componentName = FirstNotEmpty(alias.SourceName, map.CanonicalBlank.CanonicalName);
+        var materialLine = $"Материал: {componentName}; код {alias.OneCCode}; остаток склада: {FormatDecimal(materialStock)} {UiText.DisplayUnit(map.ConsumptionUnit)}; норма: {FormatDecimal(consumption)} {UiText.DisplayUnit(map.ConsumptionUnit)} на деталь.";
+        return new ProductionLaunchPreview(
+            row.Ips,
+            row.Designation,
+            FirstNotEmpty(part.Name, row.Name),
+            alias.OneCCode,
+            componentName,
+            consumption,
+            map.ConsumptionUnit,
+            materialStock,
+            maxQuantity,
+            defaultQuantity,
+            materialLine,
+            shortageRows);
+    }
+
+    private async Task LoadDetailMetricsAsync(MskLibraryRow? row, int version)
+    {
+        if (row is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var batchId = await dbContext.DemandBatches
+                .AsNoTracking()
+                .OrderByDescending(x => x.ImportedAt)
+                .ThenByDescending(x => x.Id)
+                .Select(x => (long?)x.Id)
+                .FirstOrDefaultAsync();
+            var demandQuantities = batchId is null
+                ? []
+                : await dbContext.DemandItems
+                    .AsNoTracking()
+                    .Where(x => x.DemandBatchId == batchId.Value && x.Ips == row.Ips)
+                    .Select(x => x.Quantity)
+                    .ToListAsync();
+            var demandQuantity = demandQuantities.Sum();
+
+            var snapshotId = await dbContext.StockSnapshots
+                .AsNoTracking()
+                .OrderByDescending(x => x.ImportedAt)
+                .ThenByDescending(x => x.Id)
+                .Select(x => (long?)x.Id)
+                .FirstOrDefaultAsync();
+            var inProduction = 0m;
+            if (snapshotId is not null)
+            {
+                var ipsKey = StockCodeNormalizer.NormalizeForComparison(row.Ips);
+                var stockItems = await dbContext.StockItems
+                    .AsNoTracking()
+                    .Where(x => x.StockSnapshotId == snapshotId.Value && x.Unit == MeasurementUnit.Piece)
+                    .ToListAsync();
+                inProduction = stockItems
+                    .Where(x =>
+                        StockWarehouseRules.IsCmoWipWarehouse(x.Warehouse) &&
+                        StockCodeNormalizer.NormalizeForComparison(x.OneCCode) == ipsKey)
+                    .Sum(x => x.Quantity);
+            }
+
+            var availableLaunchText = "нет данных";
+            try
+            {
+                var preview = await BuildProductionLaunchPreviewAsync(row);
+                availableLaunchText = $"{FormatDecimal(preview.MaxQuantity)} шт";
+            }
+            catch (Exception ex)
+            {
+                availableLaunchText = $"не рассчитано: {ex.GetBaseException().Message}";
+            }
+
+            if (version == Volatile.Read(ref detailMetricsVersion) && SelectedRow?.Ips == row.Ips)
+            {
+                DetailMetricsText =
+                    $"В потребности сейчас: {FormatDecimal(demandQuantity)} шт\n" +
+                    $"В производстве: {FormatDecimal(inProduction)} шт\n" +
+                    $"Доступно для запуска: {availableLaunchText}";
+            }
+        }
+        catch (Exception ex)
+        {
+            if (version == Volatile.Read(ref detailMetricsVersion) && SelectedRow?.Ips == row.Ips)
+            {
+                DetailMetricsText = $"Показатели не рассчитаны: {ex.GetBaseException().Message}";
+            }
+        }
+    }
+
+    private async Task<IReadOnlyList<ProductionLaunchShortageRow>> BuildDemandShortageRowsAsync(string ips, IReadOnlyList<StockItem> stockItems)
+    {
+        var batch = await dbContext.DemandBatches
+            .AsNoTracking()
+            .OrderByDescending(x => x.ImportedAt)
+            .ThenByDescending(x => x.Id)
+            .FirstOrDefaultAsync();
+        if (batch is null)
+        {
+            return [];
+        }
+
+        var ipsKey = StockCodeNormalizer.NormalizeForComparison(ips);
+        var wip = stockItems
+            .Where(x =>
+                StockWarehouseRules.IsCmoWipWarehouse(x.Warehouse) &&
+                StockCodeNormalizer.NormalizeForComparison(x.OneCCode) == ipsKey &&
+                x.Unit == MeasurementUnit.Piece)
+            .Sum(x => x.Quantity);
+        var demand = await dbContext.DemandItems
+            .AsNoTracking()
+            .Where(x => x.DemandBatchId == batch.Id && x.Ips == ips)
+            .OrderBy(x => x.DemandDate ?? DateTime.MaxValue)
+            .ThenBy(x => x.Id)
+            .ToListAsync();
+        var rows = new List<ProductionLaunchShortageRow>();
+        foreach (var item in demand)
+        {
+            var coveredByWip = Math.Min(item.Quantity, Math.Max(0m, wip));
+            wip -= coveredByWip;
+            var deficit = Math.Max(0m, item.Quantity - coveredByWip);
+            if (deficit <= 0)
+            {
+                continue;
+            }
+
+            rows.Add(new ProductionLaunchShortageRow(
+                deficit,
+                FirstNotEmpty(item.Project, "проект не указан"),
+                FirstNotEmpty(item.ProductionSystem, item.SerialNumber, "№ станка не указан"),
+                item.DemandDate));
+        }
+
+        return rows;
+    }
+
+    public async Task<IReadOnlyList<ExternalServiceWipRow>> LoadExternalServiceWipRowsAsync()
+    {
+        var snapshot = await dbContext.StockSnapshots
+            .AsNoTracking()
+            .OrderByDescending(x => x.SnapshotDate)
+            .ThenByDescending(x => x.Id)
+            .FirstOrDefaultAsync();
+        if (snapshot is null)
+        {
+            throw new InvalidOperationException("Нет снимка остатков 1С. Нажмите \"Обновить данные 1С\".");
+        }
+
+        var stockRows = await dbContext.StockItems
+            .AsNoTracking()
+            .Where(x => x.StockSnapshotId == snapshot.Id && x.Unit == MeasurementUnit.Piece && x.Quantity > 0)
+            .ToListAsync();
+        stockRows = stockRows
+            .Where(x => IsExternalServiceSourceWarehouse(x.Warehouse))
+            .ToList();
+
+        var parts = await dbContext.Parts
+            .AsNoTracking()
+            .ToListAsync();
+        var partsByCode = parts
+            .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.Ips), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.OrderByDescending(p => p.UpdatedAt).First(), StringComparer.OrdinalIgnoreCase);
+
+        var demandBatchId = await dbContext.DemandBatches
+            .AsNoTracking()
+            .OrderByDescending(x => x.ImportedAt)
+            .ThenByDescending(x => x.Id)
+            .Select(x => (long?)x.Id)
+            .FirstOrDefaultAsync();
+        var demandByIps = new Dictionary<string, List<DemandItem>>(StringComparer.OrdinalIgnoreCase);
+        if (demandBatchId is not null)
+        {
+            var demandItems = await dbContext.DemandItems
+                .AsNoTracking()
+                .Where(x => x.DemandBatchId == demandBatchId.Value && x.Quantity > 0)
+                .OrderBy(x => x.DemandDate ?? DateTime.MaxValue)
+                .ThenBy(x => x.Id)
+                .ToListAsync();
+            demandByIps = demandItems
+                .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.Ips), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(x => x.Key, x => x.ToList(), StringComparer.OrdinalIgnoreCase);
+        }
+
+        var result = new List<ExternalServiceWipRow>();
+        foreach (var group in stockRows
+            .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode), StringComparer.OrdinalIgnoreCase)
+            .Where(x => !string.IsNullOrWhiteSpace(x.Key)))
+        {
+            var first = group.OrderBy(x => x.SourceName).First();
+            var quantity = group.Sum(x => x.Quantity);
+            partsByCode.TryGetValue(group.Key, out var part);
+            if (part is null || !HasAnyExternalServiceRequirement(part))
+            {
+                continue;
+            }
+
+            var requiredPart = part;
+            var ips = requiredPart.Ips;
+            var designation = requiredPart.Designation ?? string.Empty;
+            var name = FirstNotEmpty(requiredPart.Name, first.SourceName, ips);
+            demandByIps.TryGetValue(group.Key, out var demandRows);
+            var hasDemandRequirement = demandRows?.Any(x => x.Quantity > 0) == true;
+            result.Add(new ExternalServiceWipRow(
+                first.OneCCode,
+                ips,
+                designation,
+                name,
+                quantity,
+                string.Empty,
+                string.Empty,
+                null,
+                BuildExternalServiceDemandAllocations(quantity, demandRows ?? []),
+                requiredPart.RequiresNitriding,
+                requiredPart.RequiresHeatTreatment,
+                requiredPart.RequiresChemicalOxidation,
+                requiredPart.RequiresKeyway,
+                hasDemandRequirement));
+        }
+
+        return result
+            .OrderBy(x => x.Ips, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static bool HasAnyExternalServiceRequirement(Part part) =>
+        part.RequiresNitriding ||
+        part.RequiresHeatTreatment ||
+        part.RequiresChemicalOxidation ||
+        part.RequiresKeyway;
+
+    public static bool MatchesExternalServiceType(ExternalServiceWipRow row, string? serviceType)
+    {
+        var service = UiSearchText.Normalize(serviceType);
+        if (service.Length == 0)
+        {
+            return row.HasExternalServiceRequirement;
+        }
+
+        if (service.Contains(UiSearchText.Normalize("Азотирование"), StringComparison.Ordinal))
+        {
+            return row.RequiresNitriding;
+        }
+
+        if (service.Contains(UiSearchText.Normalize("Термообработка"), StringComparison.Ordinal) ||
+            service == UiSearchText.Normalize("ТО"))
+        {
+            return row.RequiresHeatTreatment;
+        }
+
+        if (service.Contains(UiSearchText.Normalize("Хим"), StringComparison.Ordinal) ||
+            service.Contains(UiSearchText.Normalize("Окс"), StringComparison.Ordinal))
+        {
+            return row.RequiresChemicalOxidation;
+        }
+
+        if (service.Contains(UiSearchText.Normalize("Шпон"), StringComparison.Ordinal) ||
+            service.Contains(UiSearchText.Normalize("Паз"), StringComparison.Ordinal))
+        {
+            return row.RequiresKeyway;
+        }
+
+        return row.HasExternalServiceRequirement;
+    }
+
+    public static decimal CalculateExternalServiceDemandQuantity(ExternalServiceWipRow row)
+    {
+        var stockMarker = UiSearchText.Normalize("на склад");
+        var demandQuantity = row.DemandAllocations
+            .Where(x => x.DemandDate is not null && UiSearchText.Normalize(x.MachineNumber) != stockMarker)
+            .Sum(x => x.Quantity);
+        if (demandQuantity <= 0)
+        {
+            return 0m;
+        }
+
+        return Math.Min(row.AvailableQuantity, demandQuantity);
+    }
+
+    public static IReadOnlyList<ExternalServiceDemandAllocation> BuildExternalServiceDemandAllocations(decimal availableQuantity, IReadOnlyList<DemandItem> demandRows)
+    {
+        var result = new List<ExternalServiceDemandAllocation>();
+        var remaining = Math.Max(0m, availableQuantity);
+        foreach (var demand in demandRows
+            .Where(x => x.Quantity > 0)
+            .OrderBy(x => x.DemandDate ?? DateTime.MaxValue)
+            .ThenBy(x => x.Id))
+        {
+            if (remaining <= 0)
+            {
+                break;
+            }
+
+            var quantity = Math.Min(remaining, demand.Quantity);
+            if (quantity <= 0)
+            {
+                continue;
+            }
+
+            result.Add(new ExternalServiceDemandAllocation(
+                FirstNotEmpty(demand.Project, "на склад"),
+                FirstNotEmpty(demand.ProductionSystem, demand.SerialNumber, "на склад"),
+                quantity,
+                demand.DemandDate));
+            remaining -= quantity;
+        }
+
+        if (remaining > 0)
+        {
+            result.Add(new ExternalServiceDemandAllocation("на склад", "на склад", remaining, null));
+        }
+
+        return result;
+    }
+
+    private OneCGoodsTransferRequest? ShowExternalServicesDialog(IReadOnlyList<ExternalServiceWipRow> sourceRows)
+    {
+        var rows = new ObservableCollection<ExternalServiceWipRow>(sourceRows);
+        var serviceTypes = UiReferenceData.ServiceTypes();
+        var window = new Window
+        {
+            Title = "Услуги на стороне",
+            Width = 980,
+            Height = 720,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = Application.Current?.MainWindow,
+            ResizeMode = ResizeMode.CanResize
+        };
+
+        var root = new DockPanel { Margin = new Thickness(18) };
+        var buttons = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 12, 0, 0) };
+        DockPanel.SetDock(buttons, Dock.Bottom);
+        root.Children.Add(buttons);
+
+        var content = new DockPanel();
+        root.Children.Add(content);
+        var top = new StackPanel { Margin = new Thickness(0, 0, 0, 10) };
+        DockPanel.SetDock(top, Dock.Top);
+        content.Children.Add(top);
+
+        top.Children.Add(new TextBlock { Text = "Выберите продукцию и вид услуги для отправки на сторону", FontSize = 18, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 10) });
+        var firstLine = new WrapPanel();
+        firstLine.Children.Add(new TextBlock { Text = "Вид услуги:", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 6) });
+        var serviceTypeBox = new ComboBox { Width = 180, ItemsSource = serviceTypes, SelectedIndex = 0, Margin = new Thickness(0, 0, 14, 6) };
+        firstLine.Children.Add(serviceTypeBox);
+        firstLine.Children.Add(new TextBlock { Text = "Поиск:", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 6) });
+        var searchBox = new TextBox { Width = 260, Margin = new Thickness(0, 0, 14, 6) };
+        firstLine.Children.Add(searchBox);
+        top.Children.Add(firstLine);
+        var demandOptionsLine = new StackPanel { Margin = new Thickness(0, 0, 0, 2) };
+        var onlyInDemandBox = new System.Windows.Controls.CheckBox { Content = "Только в потребности", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 14, 4) };
+        var autoSelectBox = new System.Windows.Controls.CheckBox { Content = "Авто выбор", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 14, 6) };
+        demandOptionsLine.Children.Add(onlyInDemandBox);
+        demandOptionsLine.Children.Add(autoSelectBox);
+        top.Children.Add(demandOptionsLine);
+
+        top.Children.Add(new TextBlock { Text = "Комментарий для 1С:", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 8, 0, 4) });
+        var commentBox = new TextBox { Height = 60, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true };
+        top.Children.Add(commentBox);
+        var commentEdited = false;
+        var updatingComment = false;
+        bool MatchesDialogFilters(ExternalServiceWipRow row) =>
+            MatchesExternalServiceType(row, serviceTypeBox.SelectedItem as string) &&
+            (!onlyInDemandBox.IsChecked.GetValueOrDefault() || row.HasDemandRequirement);
+
+        IReadOnlyList<ExternalServiceWipRow> SelectedRows() => rows
+            .Where(x => x.IsSelected && MatchesDialogFilters(x))
+            .ToList();
+
+        void ApplyDemandQuantities(bool selectRows)
+        {
+            foreach (var row in rows)
+            {
+                var demandQuantity = CalculateExternalServiceDemandQuantity(row);
+                if (demandQuantity > 0 && MatchesExternalServiceType(row, serviceTypeBox.SelectedItem as string))
+                {
+                    row.QuantityText = FormatDecimal(demandQuantity);
+                    if (selectRows)
+                    {
+                        row.IsSelected = MatchesDialogFilters(row);
+                    }
+                }
+                else if (selectRows)
+                {
+                    row.IsSelected = false;
+                }
+            }
+        }
+
+        void RefreshExternalServiceComment(bool force)
+        {
+            if (!force && commentEdited)
+            {
+                return;
+            }
+
+            updatingComment = true;
+            commentBox.Text = BuildExternalServiceComment(serviceTypeBox.SelectedItem as string ?? serviceTypes[0], SelectedRows());
+            updatingComment = false;
+        }
+
+        commentBox.TextChanged += (_, _) =>
+        {
+            if (!updatingComment)
+            {
+                commentEdited = true;
+            }
+        };
+        serviceTypeBox.SelectionChanged += (_, _) =>
+        {
+            if (onlyInDemandBox.IsChecked.GetValueOrDefault())
+            {
+                ApplyDemandQuantities(selectRows: autoSelectBox.IsChecked.GetValueOrDefault());
+            }
+
+            foreach (var row in rows.Where(x => !MatchesDialogFilters(x)))
+            {
+                row.IsSelected = false;
+            }
+
+            CollectionViewSource.GetDefaultView(rows)?.Refresh();
+            RefreshExternalServiceComment(force: false);
+        };
+        onlyInDemandBox.Checked += (_, _) =>
+        {
+            ApplyDemandQuantities(selectRows: autoSelectBox.IsChecked.GetValueOrDefault());
+            foreach (var row in rows.Where(x => !MatchesDialogFilters(x)))
+            {
+                row.IsSelected = false;
+            }
+
+            CollectionViewSource.GetDefaultView(rows)?.Refresh();
+            RefreshExternalServiceComment(force: false);
+        };
+        onlyInDemandBox.Unchecked += (_, _) =>
+        {
+            CollectionViewSource.GetDefaultView(rows)?.Refresh();
+            RefreshExternalServiceComment(force: false);
+        };
+        autoSelectBox.Checked += (_, _) =>
+        {
+            ApplyDemandQuantities(selectRows: true);
+            CollectionViewSource.GetDefaultView(rows)?.Refresh();
+            RefreshExternalServiceComment(force: false);
+        };
+        autoSelectBox.Unchecked += (_, _) =>
+        {
+            foreach (var row in rows.Where(x => x.HasDemandRequirement && MatchesExternalServiceType(x, serviceTypeBox.SelectedItem as string)))
+            {
+                row.IsSelected = false;
+            }
+
+            CollectionViewSource.GetDefaultView(rows)?.Refresh();
+            RefreshExternalServiceComment(force: false);
+        };
+        foreach (var row in rows)
+        {
+            row.PropertyChanged += (_, args) =>
+            {
+                if (args.PropertyName is nameof(ExternalServiceWipRow.IsSelected) or nameof(ExternalServiceWipRow.QuantityText))
+                {
+                    RefreshExternalServiceComment(force: false);
+                }
+            };
+        }
+
+        var status = new TextBlock { Foreground = Brushes.Firebrick, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
+        top.Children.Add(status);
+
+        var grid = new DataGrid
+        {
+            AutoGenerateColumns = false,
+            ItemsSource = rows,
+            SelectionUnit = DataGridSelectionUnit.Cell,
+            SelectionMode = DataGridSelectionMode.Extended,
+            CanUserAddRows = false,
+            HeadersVisibility = DataGridHeadersVisibility.Column,
+            IsReadOnly = false
+        };
+        var selectCellFactory = new FrameworkElementFactory(typeof(System.Windows.Controls.CheckBox));
+        selectCellFactory.SetBinding(System.Windows.Controls.Primitives.ToggleButton.IsCheckedProperty, new Binding(nameof(ExternalServiceWipRow.IsSelected)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged });
+        selectCellFactory.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+        selectCellFactory.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+        selectCellFactory.SetValue(UIElement.FocusableProperty, false);
+        grid.Columns.Add(new DataGridTemplateColumn { Header = "", CellTemplate = new DataTemplate { VisualTree = selectCellFactory }, Width = 36 });
+        grid.Columns.Add(new DataGridTextColumn { Header = "IPS/код", Binding = new Binding(nameof(ExternalServiceWipRow.Ips)), IsReadOnly = true, Width = 110 });
+        grid.Columns.Add(new DataGridTextColumn { Header = "Обозначение", Binding = new Binding(nameof(ExternalServiceWipRow.Designation)), IsReadOnly = true, Width = 180 });
+        grid.Columns.Add(new DataGridTextColumn { Header = "Наименование", Binding = new Binding(nameof(ExternalServiceWipRow.Name)), IsReadOnly = true, Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
+        grid.Columns.Add(new DataGridTextColumn { Header = "Остаток", Binding = new Binding(nameof(ExternalServiceWipRow.AvailableText)), IsReadOnly = true, Width = 90 });
+        grid.Columns.Add(new DataGridTextColumn { Header = "Переместить", Binding = new Binding(nameof(ExternalServiceWipRow.QuantityText)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged }, Width = 110 });
+        content.Children.Add(grid);
+
+        var view = CollectionViewSource.GetDefaultView(rows);
+        view.Filter = item =>
+        {
+            if (item is not ExternalServiceWipRow row)
+            {
+                return false;
+            }
+
+            var search = searchBox.Text.Trim();
+            if (!MatchesDialogFilters(row))
+            {
+                return false;
+            }
+
+            return string.IsNullOrWhiteSpace(search) ||
+                UiSearchText.Contains(row.Ips, search) ||
+                UiSearchText.Contains(row.OneCCode, search) ||
+                UiSearchText.Contains(row.Designation, search) ||
+                UiSearchText.Contains(row.Name, search) ||
+                UiSearchText.Contains(row.Project, search) ||
+                UiSearchText.Contains(row.MachineNumber, search);
+        };
+        searchBox.TextChanged += (_, _) => view.Refresh();
+
+        var createButton = new Button { Content = "Создать перемещение 1С", MinWidth = 180, Margin = new Thickness(6, 0, 0, 0) };
+        var exportRequestButton = new Button { Content = "Сформировать заявку", MinWidth = 150, Margin = new Thickness(6, 0, 0, 0) };
+        var cancelButton = new Button { Content = "Отмена", MinWidth = 90, Margin = new Thickness(6, 0, 0, 0) };
+        buttons.Children.Add(cancelButton);
+        buttons.Children.Add(exportRequestButton);
+        buttons.Children.Add(createButton);
+
+        OneCGoodsTransferRequest? result = null;
+        cancelButton.Click += (_, _) => window.Close();
+        exportRequestButton.Click += (_, _) =>
+        {
+            var serviceType = serviceTypeBox.SelectedItem as string ?? serviceTypes[0];
+            var selectedRows = SelectedRows();
+            if (!TryBuildExternalServiceTransferRequest(serviceType, commentBox.Text, selectedRows, out _, out var error))
+            {
+                status.Foreground = Brushes.Firebrick;
+                status.Text = error;
+                return;
+            }
+
+            var dialog = new SaveFileDialog
+            {
+                Title = "Сформировать заявку на услугу",
+                Filter = "Excel (*.xlsx)|*.xlsx",
+                FileName = $"Заявка на услугу ЦМО от {DateTime.Now:dd.MM.yyyy}.xlsx"
+            };
+            if (dialog.ShowDialog(window) != true)
+            {
+                return;
+            }
+
+            try
+            {
+                ExportExternalServiceRequestForm(dialog.FileName, serviceType, selectedRows);
+                status.Foreground = Brushes.SeaGreen;
+                status.Text = $"Заявка сформирована: {dialog.FileName}";
+                Process.Start(new ProcessStartInfo(dialog.FileName) { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                status.Foreground = Brushes.Firebrick;
+                status.Text = $"Не удалось сформировать заявку: {ex.GetBaseException().Message}";
+            }
+        };
+        createButton.Click += async (_, _) =>
+        {
+            var serviceType = serviceTypeBox.SelectedItem as string ?? serviceTypes[0];
+            var selectedRows = SelectedRows();
+            RefreshExternalServiceComment(force: string.IsNullOrWhiteSpace(commentBox.Text));
+            if (!TryBuildExternalServiceTransferRequest(serviceType, commentBox.Text, selectedRows, out var request, out var error))
+            {
+                status.Foreground = Brushes.Firebrick;
+                status.Text = error;
+                return;
+            }
+
+            try
+            {
+                createButton.IsEnabled = false;
+                IsBusy = true;
+                ProductionLaunchStatusText = "Создание перемещения 1С для услуг на стороне...";
+                status.Foreground = Brushes.DimGray;
+                status.Text = ProductionLaunchStatusText;
+                var transferResult = await oneCGoodsTransferService!.CreateTransferAsync(request!, CancellationToken.None);
+                ProductionLaunchStatusText = $"Создано перемещение 1С {transferResult.Number}; проведено: {(transferResult.Posted ? "да" : "нет")}.";
+                StatusText = ProductionLaunchStatusText;
+                status.Foreground = Brushes.SeaGreen;
+                status.Text = $"{ProductionLaunchStatusText} Окно оставлено открытым, можно сформировать заявку.";
+                MessageBox.Show(
+                    $"Перемещение 1С создано.\nНомер: {transferResult.Number}\nСтрок: {request!.Items.Count}\nДокумент не проведен.\n\nКомментарий:\n{transferResult.Comment}",
+                    "Услуги на стороне",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Could not create 1C goods transfer for external services");
+                ProductionLaunchStatusText = $"Ошибка перемещения: {ex.GetBaseException().Message}";
+                status.Foreground = Brushes.Firebrick;
+                status.Text = ProductionLaunchStatusText;
+                MessageBox.Show($"Не удалось создать перемещение 1С.\n{ex.GetBaseException().Message}", "Услуги на стороне", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                IsBusy = false;
+                createButton.IsEnabled = true;
+            }
+        };
+
+        window.Content = root;
+        RefreshExternalServiceComment(force: true);
+        window.ShowDialog();
+        return result;
+    }
+
+    public static bool TryBuildExternalServiceTransferRequest(
+        string serviceType,
+        string comment,
+        IReadOnlyList<ExternalServiceWipRow> selectedRows,
+        out OneCGoodsTransferRequest? request,
+        out string error)
+    {
+        request = null;
+        error = string.Empty;
+        var items = new List<OneCGoodsTransferItem>();
+        foreach (var row in selectedRows)
+        {
+            if (!TryParseExternalServiceQuantity(row, out var quantity, out error))
+            {
+                return false;
+            }
+
+            items.Add(new OneCGoodsTransferItem(row.OneCCode, row.Name, quantity));
+        }
+
+        if (items.Count == 0)
+        {
+            error = "Выберите хотя бы одну деталь из НЗП.";
+            return false;
+        }
+
+        var service = string.IsNullOrWhiteSpace(serviceType) ? "Услуги на стороне" : serviceType.Trim();
+        request = new OneCGoodsTransferRequest(
+            service,
+            string.IsNullOrWhiteSpace(comment) ? BuildExternalServiceComment(service, selectedRows) : comment.Trim(),
+            items
+                .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode), StringComparer.OrdinalIgnoreCase)
+                .Select(x => new OneCGoodsTransferItem(
+                    x.First().OneCCode,
+                    x.First().Name,
+                    x.Sum(i => i.Quantity)))
+                .ToList());
+        return true;
+    }
+
+    public static string BuildExternalServiceComment(string serviceType, IReadOnlyList<ExternalServiceWipRow> selectedRows)
+    {
+        var service = string.IsNullOrWhiteSpace(serviceType) ? "Услуги на стороне" : serviceType.Trim();
+        var parts = BuildExternalServiceRequestRows(service, selectedRows)
+            .GroupBy(row => row.Ips, StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var machines = group
+                    .Select(row => $"{FirstNotEmpty(row.MachineNumber, "на склад")} - {FormatDecimal(row.Quantity)} шт")
+                    .ToList();
+                return $"IPS {group.Key} {string.Join("; ", machines)}";
+            })
+            .ToList();
+        return parts.Count == 0
+            ? $"Услуги на стороне: {service}"
+            : $"Услуги на стороне: {service} {string.Join(". ", parts)}";
+    }
+
+    public static DateTime CalculateExternalServiceReadyDate(string serviceType, DateTime formedAt) =>
+        formedAt.Date.AddDays(GetExternalServiceLeadTimeDays(serviceType));
+
+    public static int GetExternalServiceLeadTimeDays(string serviceType)
+    {
+        var service = UiSearchText.Normalize(serviceType);
+        return service.Contains(UiSearchText.Normalize("Азотирование"), StringComparison.Ordinal)
+            ? 10
+            : 7;
+    }
+
+    public static IReadOnlyList<ExternalServiceRequestRow> BuildExternalServiceRequestRows(string serviceType, IReadOnlyList<ExternalServiceWipRow> selectedRows, DateTime? formedAt = null)
+    {
+        var service = string.IsNullOrWhiteSpace(serviceType) ? "Услуги на стороне" : serviceType.Trim();
+        var readyDate = CalculateExternalServiceReadyDate(service, formedAt ?? DateTime.Today);
+        var result = new List<ExternalServiceRequestRow>();
+        foreach (var row in selectedRows.Where(x => x.IsSelected))
+        {
+            if (!TryParseExternalServiceQuantity(row, out var selectedQuantity, out _) || selectedQuantity <= 0)
+            {
+                continue;
+            }
+
+            var remaining = selectedQuantity;
+            var allocations = row.DemandAllocations.Count > 0
+                ? row.DemandAllocations
+                : [new ExternalServiceDemandAllocation("на склад", "на склад", row.AvailableQuantity, null)];
+            foreach (var allocation in allocations)
+            {
+                if (remaining <= 0)
+                {
+                    break;
+                }
+
+                var quantity = Math.Min(remaining, allocation.Quantity);
+                if (quantity <= 0)
+                {
+                    continue;
+                }
+
+                var isUrgent = allocation.DemandDate is not null && readyDate > allocation.DemandDate.Value.Date;
+                result.Add(new ExternalServiceRequestRow(
+                    allocation.Project,
+                    allocation.MachineNumber,
+                    row.Ips,
+                    row.Nomenclature,
+                    "шт",
+                    quantity,
+                    service,
+                    allocation.DemandDate,
+                    readyDate,
+                    isUrgent,
+                    isUrgent ? "СРОЧНО!" : string.Empty));
+                remaining -= quantity;
+            }
+
+            if (remaining > 0)
+            {
+                result.Add(new ExternalServiceRequestRow("на склад", "на склад", row.Ips, row.Nomenclature, "шт", remaining, service, null, readyDate, false, string.Empty));
+            }
+        }
+
+        return result;
+    }
+
+    public static void ExportExternalServiceRequestForm(string filePath, string serviceType, IReadOnlyList<ExternalServiceWipRow> selectedRows, DateTime? formedAt = null)
+    {
+        ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
+        using var package = new ExcelPackage();
+        var sheet = package.Workbook.Worksheets.Add("Заявка");
+        var headers = new[]
+        {
+            "№",
+            "ПС",
+            "№ станка",
+            "Код IPS",
+            "Номенклатура",
+            "Ед. измерения",
+            "Кол-во",
+            "Обоснование",
+            "Дата потребности",
+            "Примечание",
+            "Цена, руб",
+            "Стоимость, руб"
+        };
+        for (var column = 0; column < headers.Length; column++)
+        {
+            sheet.Cells[1, column + 1].Value = headers[column];
+        }
+
+        using (var range = sheet.Cells[1, 1, 1, headers.Length])
+        {
+            range.Style.Font.Bold = true;
+            range.Style.Fill.PatternType = OfficeOpenXml.Style.ExcelFillStyle.Solid;
+            range.Style.Fill.BackgroundColor.SetColor(System.Drawing.Color.FromArgb(230, 236, 245));
+            range.Style.Border.Bottom.Style = OfficeOpenXml.Style.ExcelBorderStyle.Thin;
+        }
+
+        var service = string.IsNullOrWhiteSpace(serviceType) ? "Услуги на стороне" : serviceType.Trim();
+        var expandedRowNumber = 2;
+        var expandedIndex = 1;
+        foreach (var requestRow in BuildExternalServiceRequestRows(serviceType, selectedRows, formedAt))
+        {
+            sheet.Cells[expandedRowNumber, 1].Value = expandedIndex++;
+            sheet.Cells[expandedRowNumber, 2].Value = requestRow.Project;
+            sheet.Cells[expandedRowNumber, 3].Value = requestRow.MachineNumber;
+            sheet.Cells[expandedRowNumber, 4].Value = requestRow.Ips;
+            sheet.Cells[expandedRowNumber, 5].Value = requestRow.Nomenclature;
+            sheet.Cells[expandedRowNumber, 6].Value = requestRow.UnitName;
+            sheet.Cells[expandedRowNumber, 7].Value = (double)requestRow.Quantity;
+            sheet.Cells[expandedRowNumber, 8].Value = requestRow.Justification;
+            sheet.Cells[expandedRowNumber, 9].Value = requestRow.ServiceReadyDate;
+            sheet.Cells[expandedRowNumber, 9].Style.Numberformat.Format = "dd.mm.yyyy";
+            if (requestRow.IsUrgent)
+            {
+                sheet.Cells[expandedRowNumber, 9].Style.Font.Bold = true;
+                sheet.Cells[expandedRowNumber, 9].Style.Font.Color.SetColor(System.Drawing.Color.Red);
+            }
+
+            sheet.Cells[expandedRowNumber, 10].Value = requestRow.Note;
+            if (requestRow.IsUrgent)
+            {
+                sheet.Cells[expandedRowNumber, 10].Style.Font.Bold = true;
+                sheet.Cells[expandedRowNumber, 10].Style.Font.Color.SetColor(System.Drawing.Color.Red);
+            }
+
+            sheet.Cells[expandedRowNumber, 11].Value = string.Empty;
+            sheet.Cells[expandedRowNumber, 12].Value = string.Empty;
+            expandedRowNumber++;
+        }
+
+        sheet.View.FreezePanes(2, 1);
+        sheet.Cells[sheet.Dimension.Address].AutoFitColumns();
+        package.SaveAs(new FileInfo(filePath));
+        return;
+
+        var rowNumber = 2;
+        var index = 1;
+        foreach (var row in selectedRows.Where(x => x.IsSelected))
+        {
+            if (!TryParseExternalServiceQuantity(row, out var quantity, out _) || quantity <= 0)
+            {
+                continue;
+            }
+
+            sheet.Cells[rowNumber, 1].Value = index++;
+            sheet.Cells[rowNumber, 2].Value = row.Project;
+            sheet.Cells[rowNumber, 3].Value = row.MachineNumber;
+            sheet.Cells[rowNumber, 4].Value = row.Ips;
+            sheet.Cells[rowNumber, 5].Value = row.Nomenclature;
+            sheet.Cells[rowNumber, 6].Value = "шт";
+            sheet.Cells[rowNumber, 7].Value = (double)quantity;
+            sheet.Cells[rowNumber, 8].Value = service;
+            if (row.DemandDate is not null)
+            {
+                sheet.Cells[rowNumber, 9].Value = row.DemandDate.Value;
+                sheet.Cells[rowNumber, 9].Style.Numberformat.Format = "dd.mm.yyyy";
+            }
+
+            sheet.Cells[rowNumber, 10].Value = string.Empty;
+            sheet.Cells[rowNumber, 11].Value = string.Empty;
+            rowNumber++;
+        }
+
+        sheet.View.FreezePanes(2, 1);
+        sheet.Cells[sheet.Dimension.Address].AutoFitColumns();
+        package.SaveAs(new FileInfo(filePath));
+    }
+
+    private static bool TryParseExternalServiceQuantity(ExternalServiceWipRow row, out decimal quantity, out string error)
+    {
+        quantity = 0m;
+        error = string.Empty;
+        if (!TryParseProductionLaunchQuantity(row.QuantityText, out quantity) || quantity <= 0)
+        {
+            error = $"Некорректное количество для {row.Ips}.";
+            return false;
+        }
+
+        if (quantity != decimal.Floor(quantity))
+        {
+            error = $"Для услуг на стороне количество должно быть целым в шт: {row.Ips}.";
+            return false;
+        }
+
+        if (quantity > row.AvailableQuantity)
+        {
+            error = $"Нельзя переместить больше остатка НЗП для {row.Ips}: доступно {FormatDecimal(row.AvailableQuantity)} шт.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static int SelectExternalServiceRowsByText(IEnumerable<ExternalServiceWipRow> rows, string text)
+    {
+        var keys = Regex.Split(text, @"[\s,;]+")
+            .Select(x => x.Trim())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .SelectMany(x => new[] { UiSearchText.Normalize(x), StockCodeNormalizer.NormalizeForComparison(x) })
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (keys.Count == 0)
+        {
+            return 0;
+        }
+
+        var count = 0;
+        foreach (var row in rows)
+        {
+            var matches = keys.Contains(UiSearchText.Normalize(row.Ips)) ||
+                keys.Contains(StockCodeNormalizer.NormalizeForComparison(row.Ips)) ||
+                keys.Contains(StockCodeNormalizer.NormalizeForComparison(row.OneCCode)) ||
+                keys.Contains(UiSearchText.Normalize(row.Designation));
+            row.IsSelected = matches;
+            if (matches)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static bool IsExternalServiceSourceWarehouse(string? warehouse)
+    {
+        var text = (warehouse ?? string.Empty).Trim();
+        return text.StartsWith("44", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("44 секция НЗП", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string DisplayIpsFromOneCCode(string oneCCode)
+    {
+        var normalized = StockCodeNormalizer.NormalizeForComparison(oneCCode);
+        return normalized.Length == 11 && normalized.All(char.IsDigit)
+            ? normalized.TrimStart('0')
+            : oneCCode;
+    }
+
+    private ProductionLaunchDialogResult? ShowProductionLaunchDialog(ProductionLaunchPreview preview)
+    {
+        var window = new Window
+        {
+            Title = "Запустить в производство",
+            Width = 640,
+            Height = 560,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = Application.Current?.MainWindow,
+            ResizeMode = ResizeMode.NoResize
+        };
+        var root = new DockPanel { Margin = new Thickness(18) };
+        var title = new TextBlock
+        {
+            Text = $"{preview.Ips} {preview.Designation} {preview.PartName}".Trim(),
+            FontSize = 18,
+            FontWeight = FontWeights.SemiBold,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 0, 0, 12)
+        };
+        DockPanel.SetDock(title, Dock.Top);
+        root.Children.Add(title);
+
+        var buttons = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 12, 0, 0) };
+        DockPanel.SetDock(buttons, Dock.Bottom);
+        root.Children.Add(buttons);
+
+        var content = new StackPanel();
+        root.Children.Add(content);
+        content.Children.Add(new TextBlock { Text = preview.MaterialLine, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 8) });
+        content.Children.Add(new TextBlock { Text = $"Доступно деталей для запуска: {FormatDecimal(preview.MaxQuantity)}", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 8) });
+
+        var makeMax = new System.Windows.Controls.CheckBox { Content = "Сделать сколько можно", IsChecked = true, Margin = new Thickness(0, 4, 0, 8) };
+        content.Children.Add(makeMax);
+        var piecewise = new System.Windows.Controls.CheckBox { Content = "Запуск по 1 шт", IsChecked = false, Margin = new Thickness(0, 0, 0, 8) };
+        content.Children.Add(piecewise);
+        var quantityPanel = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 8) };
+        quantityPanel.Children.Add(new TextBlock { Text = "Количество деталей:", VerticalAlignment = VerticalAlignment.Center, Width = 150 });
+        var quantityBox = new System.Windows.Controls.TextBox { Width = 120, Text = FormatDecimal(preview.MaxQuantity), IsEnabled = false };
+        quantityPanel.Children.Add(quantityBox);
+        content.Children.Add(quantityPanel);
+        var status = new TextBlock { Foreground = System.Windows.Media.Brushes.Firebrick, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 8) };
+        content.Children.Add(status);
+
+        content.Children.Add(new TextBlock { Text = "Комментарий для 1С:", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 4, 0, 4) });
+        var commentBox = new System.Windows.Controls.TextBox
+        {
+            IsReadOnly = false,
+            TextWrapping = TextWrapping.Wrap,
+            AcceptsReturn = true,
+            Height = 185,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Disabled
+        };
+        content.Children.Add(commentBox);
+
+        var launchButton = new System.Windows.Controls.Button { Content = "Запустить в производство", MinWidth = 180, Margin = new Thickness(6, 0, 0, 0) };
+        var cancelButton = new System.Windows.Controls.Button { Content = "Отмена", MinWidth = 90, Margin = new Thickness(6, 0, 0, 0) };
+        buttons.Children.Add(cancelButton);
+        buttons.Children.Add(launchButton);
+
+        ProductionLaunchDialogResult? result = null;
+        decimal CurrentQuantity()
+        {
+            if (makeMax.IsChecked == true)
+            {
+                return preview.MaxQuantity;
+            }
+
+            return TryParseProductionLaunchQuantity(quantityBox.Text, out var quantity) ? quantity : 0m;
+        }
+
+        void RefreshComment()
+        {
+            var quantity = CurrentQuantity();
+            quantityBox.IsEnabled = makeMax.IsChecked != true;
+            commentBox.Text = piecewise.IsChecked == true
+                ? BuildPiecewiseProductionLaunchCommentPreview(preview, quantity, ProductionLaunchCommentPrefix)
+                : BuildProductionLaunchComment(preview, quantity);
+            status.Text = quantity <= 0
+                ? "Укажите количество больше 0."
+                : quantity > preview.MaxQuantity
+                    ? $"Нельзя запустить больше {FormatDecimal(preview.MaxQuantity)} деталей: не хватает материала."
+                    : string.Empty;
+        }
+
+        makeMax.Checked += (_, _) =>
+        {
+            quantityBox.Text = FormatDecimal(preview.MaxQuantity);
+            RefreshComment();
+        };
+        makeMax.Unchecked += (_, _) =>
+        {
+            quantityBox.Text = FormatDecimal(preview.DefaultQuantity);
+            RefreshComment();
+        };
+        quantityBox.TextChanged += (_, _) => RefreshComment();
+        piecewise.Checked += (_, _) => RefreshComment();
+        piecewise.Unchecked += (_, _) => RefreshComment();
+        cancelButton.Click += (_, _) => window.Close();
+        launchButton.Click += (_, _) =>
+        {
+            var quantity = CurrentQuantity();
+            if (quantity <= 0 || quantity > preview.MaxQuantity)
+            {
+                RefreshComment();
+                return;
+            }
+
+            result = new ProductionLaunchDialogResult(decimal.Floor(quantity), commentBox.Text.Trim(), piecewise.IsChecked == true);
+            window.DialogResult = true;
+        };
+
+        window.Content = root;
+        RefreshComment();
+        window.ShowDialog();
+        return result;
+    }
+
+    public static IReadOnlyList<OneCProductionLaunchRequest> BuildProductionLaunchRequests(ProductionLaunchPreview preview, decimal quantity, string comment, bool piecewise)
+    {
+        var pieceCount = (int)Math.Max(0m, decimal.Floor(quantity));
+        if (!piecewise || pieceCount <= 1)
+        {
+            return [BuildProductionLaunchRequest(preview, pieceCount, comment)];
+        }
+
+        var comments = BuildPiecewiseProductionLaunchComments(preview, pieceCount, comment);
+        return comments
+            .Select(commentLine => BuildProductionLaunchRequest(preview, 1m, commentLine))
+            .ToList();
+    }
+
+    private static OneCProductionLaunchRequest BuildProductionLaunchRequest(ProductionLaunchPreview preview, decimal quantity, string comment)
+    {
+        var totalComponentQuantity = CalculateProductionLaunchMaterialQuantity(preview.ConsumptionUnit, preview.ConsumptionQuantity, quantity);
+        return new OneCProductionLaunchRequest(
+            preview.Ips,
+            preview.Designation,
+            preview.PartName,
+            quantity,
+            string.IsNullOrWhiteSpace(comment) ? BuildProductionLaunchComment(preview, quantity) : comment.Trim(),
+            [new OneCProductionLaunchComponent(preview.ComponentOneCCode, preview.ComponentName, totalComponentQuantity, preview.ConsumptionUnit)]);
+    }
+
+    private static decimal CalculateProductionLaunchMaxQuantity(MeasurementUnit unit, decimal consumption, decimal materialStock)
+    {
+        if (consumption <= 0 || materialStock < consumption)
+        {
+            return 0m;
+        }
+
+        if (unit != MeasurementUnit.Meter)
+        {
+            return decimal.Floor(materialStock / consumption);
+        }
+
+        return decimal.Floor((materialStock + ProductionLaunchMeterCutWidth) / (consumption + ProductionLaunchMeterCutWidth));
+    }
+
+    private static decimal CalculateProductionLaunchMaterialQuantity(MeasurementUnit unit, decimal consumption, decimal quantity)
+    {
+        var pieceCount = Math.Max(0m, decimal.Floor(quantity));
+        if (pieceCount <= 0 || consumption <= 0)
+        {
+            return 0m;
+        }
+
+        var baseQuantity = consumption * pieceCount;
+        if (unit != MeasurementUnit.Meter)
+        {
+            return baseQuantity;
+        }
+
+        return baseQuantity + Math.Max(0m, pieceCount - 1m) * ProductionLaunchMeterCutWidth;
+    }
+
+    private static string BuildProductionLaunchComment(ProductionLaunchPreview preview, decimal quantity)
+    {
+        return ProductionLaunchCommentPrefix + " " + BuildCoverageComment(preview.ShortageRows, quantity);
+    }
+
+    private const string ProductionLaunchCommentPrefix = "Создано ПО Планирование";
+
+    private static string BuildPiecewiseProductionLaunchCommentPreview(ProductionLaunchPreview preview, decimal quantity, string comment)
+    {
+        var pieceCount = (int)Math.Max(0m, decimal.Floor(quantity));
+        return string.Join(Environment.NewLine, BuildPiecewiseProductionLaunchComments(preview, pieceCount, comment));
+    }
+
+    private static IReadOnlyList<string> BuildPiecewiseProductionLaunchComments(ProductionLaunchPreview preview, int quantity, string comment)
+    {
+        var enteredLines = SplitCommentLines(comment);
+        if (enteredLines.Count > 1)
+        {
+            return BuildPiecewiseLaunchRows(preview.ShortageRows, quantity)
+                .Select((row, index) => index < enteredLines.Count
+                    ? enteredLines[index]
+                    : BuildPiecewiseProductionLaunchComment(ProductionLaunchCommentPrefix, row))
+                .ToList();
+        }
+
+        var prefix = enteredLines.Count == 0 ? ProductionLaunchCommentPrefix : enteredLines[0].Trim().TrimEnd('.', ';');
+        return BuildPiecewiseLaunchRows(preview.ShortageRows, quantity)
+            .Select(row => BuildPiecewiseProductionLaunchComment(prefix, row))
+            .ToList();
+    }
+
+    private static IReadOnlyList<string> SplitCommentLines(string comment)
+    {
+        return comment
+            .Split(["\r\n", "\n", "\r"], StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => x.Trim())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToList();
+    }
+
+    private static IReadOnlyList<ProductionLaunchShortageRow> BuildPiecewiseLaunchRows(IReadOnlyList<ProductionLaunchShortageRow> rows, int quantity)
+    {
+        var result = new List<ProductionLaunchShortageRow>(quantity);
+        foreach (var row in rows)
+        {
+            var count = (int)Math.Max(0m, decimal.Floor(row.Quantity));
+            for (var i = 0; i < count && result.Count < quantity; i++)
+            {
+                result.Add(row with { Quantity = 1m });
+            }
+
+            if (result.Count >= quantity)
+            {
+                break;
+            }
+        }
+
+        while (result.Count < quantity)
+        {
+            result.Add(new ProductionLaunchShortageRow(1m, string.Empty, string.Empty, null));
+        }
+
+        return result;
+    }
+
+    private static string BuildPiecewiseProductionLaunchComment(string prefix, ProductionLaunchShortageRow row)
+    {
+        return string.IsNullOrWhiteSpace(row.MachineNumber)
+            ? $"{prefix} 1 шт"
+            : $"{prefix} {row.MachineNumber}; 1 шт";
+    }
+
+    private static string BuildCoverageComment(IReadOnlyList<ProductionLaunchShortageRow> rows, decimal quantity)
+    {
+        if (quantity <= 0)
+        {
+            return "закрытие дефицита: количество запуска не указано.";
+        }
+
+        var remaining = quantity;
+        var parts = new List<string>();
+        foreach (var row in rows)
+        {
+            if (remaining <= 0)
+            {
+                break;
+            }
+
+            var covered = Math.Min(row.Quantity, remaining);
+            remaining -= covered;
+            parts.Add($"{row.MachineNumber}; {FormatDecimal(covered)} шт");
+        }
+
+        return parts.Count == 0
+            ? $"{FormatDecimal(quantity)} шт"
+            : string.Join(" ", parts);
+    }
+
     private async Task LoadFromDatabaseAsync()
     {
+        await RemoveInvalidMskLibraryPartsAsync();
+        demandIps.Clear();
+        var latestDemandBatchId = await dbContext.DemandBatches.AsNoTracking()
+            .OrderByDescending(x => x.ImportedAt)
+            .Select(x => (long?)x.Id)
+            .FirstOrDefaultAsync();
+        if (latestDemandBatchId is not null)
+        {
+            foreach (var ips in await dbContext.DemandItems.AsNoTracking()
+                .Where(x => x.DemandBatchId == latestDemandBatchId.Value && !string.IsNullOrWhiteSpace(x.Ips))
+                .Select(x => x.Ips)
+                .Distinct()
+                .ToListAsync())
+            {
+                demandIps.Add(UiText.Clean(ips));
+            }
+        }
+
         var parts = await dbContext.Parts.AsNoTracking()
             .Include(x => x.BlankMaps.Where(m => m.IsActive))
             .ThenInclude(x => x.CanonicalBlank)
@@ -2879,6 +6776,7 @@ public sealed partial class MskViewModel(
         var records = await dbContext.MskRecords.AsNoTracking().ToListAsync();
         var mskDetails = LoadMskDetailsFromReport();
         var recordsByIps = records
+            .Where(x => IsValidMskLibraryIps(x.Ips))
             .GroupBy(x => x.Ips, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.OrderByDescending(r => r.ImportedAt).First(), StringComparer.OrdinalIgnoreCase);
         var partsByIps = parts
@@ -2916,23 +6814,29 @@ public sealed partial class MskViewModel(
         ApplyFilter();
         StatusText = allRows.Count == 0
             ? "МСК еще не загружены. Нажмите \"Обновить данные МСК\"."
-            : $"Показано {Rows.Count} из {allRows.Count}; записей МСК: {records.Count}.";
+            : $"Показано {Rows.Count} из {allRows.Count}; записей МСК: {recordsByIps.Count}.";
     }
 
     private void ApplyFilter()
     {
         var searchValue = UiText.Clean(Search).Trim();
-        var filtered = string.IsNullOrWhiteSpace(searchValue)
-            ? allRows
-            : allRows.Where(x =>
-                x.Ips.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
-                x.Designation.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
-                x.Name.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
-                x.BlankType.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
-                x.BlankName.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
-                x.Material.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
-                x.OneCCode.Contains(searchValue, StringComparison.OrdinalIgnoreCase) ||
-                x.FileName.Contains(searchValue, StringComparison.OrdinalIgnoreCase)).ToList();
+        IEnumerable<MskLibraryRow> filtered = allRows;
+        if (DemandOnly)
+        {
+            filtered = filtered.Where(x => demandIps.Contains(UiText.Clean(x.Ips)));
+        }
+
+        filtered = string.IsNullOrWhiteSpace(searchValue)
+            ? filtered
+            : filtered.Where(x => UiSearchText.ContainsAnyField(searchValue,
+                x.Ips,
+                x.Designation,
+                x.Name,
+                x.BlankType,
+                x.BlankName,
+                x.Material,
+                x.OneCCode,
+                x.FileName));
 
         Rows.Clear();
         foreach (var row in filtered.Take(1000))
@@ -2941,7 +6845,9 @@ public sealed partial class MskViewModel(
         }
 
         SelectedRow = ResolvePreferredRow(searchValue);
-        StatusText = $"Показано {Rows.Count} из {allRows.Count}.";
+        StatusText = DemandOnly
+            ? $"Показано {Rows.Count} из {allRows.Count}; в потребности: {demandIps.Count}."
+            : $"Показано {Rows.Count} из {allRows.Count}.";
     }
 
     private MskLibraryRow? ResolvePreferredRow(string searchValue)
@@ -2963,7 +6869,7 @@ public sealed partial class MskViewModel(
 
         return string.IsNullOrWhiteSpace(searchValue)
             ? Rows[0]
-            : Rows.FirstOrDefault(x => string.Equals(x.Ips, searchValue, StringComparison.OrdinalIgnoreCase)) ?? Rows[0];
+            : Rows.FirstOrDefault(x => UiSearchText.EqualsNormalized(x.Ips, searchValue)) ?? Rows[0];
     }
 
     private static MskRecord ReadMskRecord(string filePath)
@@ -2999,7 +6905,18 @@ public sealed partial class MskViewModel(
 
     private static string CleanMskCell(string? value) => UiText.Clean(value).Trim();
 
+    public static bool IsValidMskLibraryIps(string? value)
+    {
+        var text = UiText.Clean(value).Trim();
+        return (text.Length == 7 || text.Length == 11) &&
+            text.Any(ch => ch != '0') &&
+            text.All(char.IsDigit);
+    }
+
     private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) ?? string.Empty;
+
+    private static bool TryParseProductionLaunchQuantity(string value, out decimal quantity) =>
+        decimal.TryParse((value ?? string.Empty).Replace(',', '.'), NumberStyles.Number, CultureInfo.InvariantCulture, out quantity);
 
     private static string BuildDetailText(MskLibraryRow row) =>
         $"IPS: {row.Ips}\n" +
@@ -3012,13 +6929,20 @@ public sealed partial class MskViewModel(
         $"Норма расхода: {row.ConsumptionQuantity} {row.UnitName}\n" +
         $"Срок заготовки, дней: {row.BlankLeadTimeDays}\n" +
         $"Есть в библиотеке: {row.HasLibraryPart}\n" +
-        $"Есть МСК: {row.HasMsk}\n" +
-        $"Файл: {row.FilePath}";
+        $"Есть МСК: {row.HasMsk}";
 
     private async Task TryOpenDrawingAsync(MskLibraryRow row, bool forceRetry)
     {
         if (string.IsNullOrWhiteSpace(row.Ips))
         {
+            return;
+        }
+
+        var outputDirectory = GetDrawingCacheDirectory();
+        var cachedDrawing = GetStableCachedDrawing(row, outputDirectory);
+        if (IsReadablePdf(cachedDrawing))
+        {
+            ShowDrawing(row, cachedDrawing, fromCache: true);
             return;
         }
 
@@ -3034,31 +6958,236 @@ public sealed partial class MskViewModel(
 
         try
         {
-            var query = FirstNotEmpty(row.Ips, row.Designation, row.Name);
-            var outputDirectory = GetDrawingCacheDirectory();
-            var drawing = await drawingService.FindDrawingPdfAsync(query, outputDirectory, CancellationToken.None);
-            if (drawing is null)
+            IsDrawingBusy = true;
+            DrawingStatusText = $"Поиск PDF-чертежа IPS {row.Ips} в локальных папках...";
+            var drawing = FindLocalDrawingPdf(row);
+            if (drawing is not null)
             {
-                StatusText = $"PDF-чертеж IPS {row.Ips} в IPS Bridge не найден.";
+                var localStableDrawing = CopyToStableCache(row, drawing, outputDirectory);
+                ShowDrawing(row, localStableDrawing, fromCache: false);
                 return;
             }
 
-            Process.Start(new ProcessStartInfo(drawing.FullName) { UseShellExecute = true });
-            StatusText = $"Открыт PDF-чертеж IPS {row.Ips}: {drawing.Name}";
+            DrawingStatusText = $"PDF-чертеж IPS {row.Ips} локально не найден. Поиск через IPS Bridge...";
+            foreach (var query in BuildDrawingQueries(row))
+            {
+                var bridgeDrawing = await drawingService.FindDrawingPdfAsync(query, outputDirectory, CancellationToken.None);
+                if (bridgeDrawing is not null && IsReadablePdf(bridgeDrawing))
+                {
+                    var stableDrawing = CopyToStableCache(row, bridgeDrawing, outputDirectory);
+                    ShowDrawing(row, stableDrawing, fromCache: false);
+                    return;
+                }
+            }
+
+            DrawingViewerSource = null;
+            DrawingStatusText = $"PDF-чертеж IPS {row.Ips} не найден локально и через IPS Bridge.";
+            StatusText = DrawingStatusText;
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Could not open IPS drawing for {Ips}", row.Ips);
-            StatusText = $"PDF-чертеж IPS {row.Ips} не открыт: {ex.GetBaseException().Message}";
+            logger.LogWarning(ex, "Could not open local drawing for {Ips}", row.Ips);
+            DrawingStatusText = $"PDF-чертеж IPS {row.Ips} не открыт: {ex.GetBaseException().Message}";
+            StatusText = DrawingStatusText;
+        }
+        finally
+        {
+            IsDrawingBusy = false;
         }
     }
 
-    private static DirectoryInfo GetDrawingCacheDirectory()
+    internal static bool IsReadablePdf(FileInfo file)
     {
-        var path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "BlankDemandPlanner",
-            "IpsDrawings");
+        if (!file.Exists || file.Length < 4)
+        {
+            return false;
+        }
+
+        using var stream = file.OpenRead();
+        Span<byte> header = stackalloc byte[4];
+        return stream.Read(header) == 4 &&
+            header[0] == '%' &&
+            header[1] == 'P' &&
+            header[2] == 'D' &&
+            header[3] == 'F';
+    }
+
+    internal static FileInfo GetStableCachedDrawing(MskLibraryRow row, DirectoryInfo outputDirectory) =>
+        new(Path.Combine(outputDirectory.FullName, MakeStableDrawingFileName(row.Ips)));
+
+    internal static FileInfo? FindLocalDrawingPdf(MskLibraryRow row)
+    {
+        foreach (var candidate in EnumerateLocalDrawingCandidates(row))
+        {
+            if (IsReadablePdf(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    internal static IEnumerable<string> BuildDrawingQueries(MskLibraryRow row)
+    {
+        var values = new List<string?>
+        {
+            row.Ips,
+            row.Designation,
+            row.Name
+        };
+
+        if (!string.IsNullOrWhiteSpace(row.Ips) && row.Ips.All(char.IsDigit) && row.Ips.Length < 11)
+        {
+            values.Insert(1, row.Ips.PadLeft(11, '0'));
+        }
+
+        return values
+            .Select(x => UiText.Clean(x).Trim())
+            .Where(x => x.Length >= 3)
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static IEnumerable<FileInfo> EnumerateLocalDrawingCandidates(MskLibraryRow row)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in EnumerateExactDrawingPaths(row))
+        {
+            if (seen.Add(path))
+            {
+                yield return new FileInfo(path);
+            }
+        }
+
+        var tokens = new[]
+            {
+                row.Ips,
+                row.Designation,
+                row.Name,
+                Path.GetFileNameWithoutExtension(row.FilePath)
+            }
+            .Select(NormalizeDrawingSearchText)
+            .Where(x => x.Length >= 4)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var directory in EnumerateDrawingDirectories(row))
+        {
+            if (!directory.Exists)
+            {
+                continue;
+            }
+
+            IEnumerable<FileInfo> files;
+            try
+            {
+                files = directory.EnumerateFiles("*.pdf", SearchOption.TopDirectoryOnly)
+                    .Concat(directory.EnumerateFiles("*.PDF", SearchOption.TopDirectoryOnly));
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var file in files)
+            {
+                if (!seen.Add(file.FullName))
+                {
+                    continue;
+                }
+
+                var normalizedName = NormalizeDrawingSearchText(Path.GetFileNameWithoutExtension(file.Name));
+                if (tokens.Any(token => normalizedName.Contains(token, StringComparison.OrdinalIgnoreCase) ||
+                    token.Contains(normalizedName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    yield return file;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateExactDrawingPaths(MskLibraryRow row)
+    {
+        if (!string.IsNullOrWhiteSpace(row.FilePath))
+        {
+            var directory = Path.GetDirectoryName(row.FilePath);
+            var fileName = Path.GetFileNameWithoutExtension(row.FilePath);
+            if (!string.IsNullOrWhiteSpace(directory) && !string.IsNullOrWhiteSpace(fileName))
+            {
+                yield return Path.Combine(directory, $"{fileName}.pdf");
+                yield return Path.Combine(directory, $"{fileName}.PDF");
+            }
+        }
+    }
+
+    private static IEnumerable<DirectoryInfo> EnumerateDrawingDirectories(MskLibraryRow row)
+    {
+        yield return new DirectoryInfo(Path.Combine(Directory.GetCurrentDirectory(), "Данные для работы", "Чертежи"));
+        yield return new DirectoryInfo(Path.Combine(AppContext.BaseDirectory, "Данные для работы", "Чертежи"));
+        yield return new DirectoryInfo(Path.Combine(AppContext.BaseDirectory, "drawings"));
+        yield return new DirectoryInfo(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            "Интеграция с сервисами",
+            "factory_ai_assistant",
+            "data",
+            "drawings"));
+
+        var configured = Environment.GetEnvironmentVariable("BLANK_DEMAND_DRAWINGS_DIR");
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            foreach (var path in configured.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                yield return new DirectoryInfo(path);
+            }
+        }
+    }
+
+    private static string NormalizeDrawingSearchText(string? value)
+    {
+        var text = UiText.Clean(value);
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        return Regex.Replace(text.ToUpperInvariant(), @"[^0-9A-ZА-Я]+", string.Empty);
+    }
+
+    private static string MakeStableDrawingFileName(string ips)
+    {
+        var safeIps = Regex.Replace(ips, @"[^A-Za-zА-Яа-я0-9_. -]+", "_").Trim(' ', '_', '.');
+        return string.IsNullOrWhiteSpace(safeIps) ? "IPS.pdf" : $"IPS_{safeIps}.pdf";
+    }
+
+    internal static FileInfo CopyToStableCache(MskLibraryRow row, FileInfo drawing, DirectoryInfo outputDirectory)
+    {
+        var target = GetStableCachedDrawing(row, outputDirectory);
+        if (!string.Equals(drawing.FullName, target.FullName, StringComparison.OrdinalIgnoreCase))
+        {
+            File.Copy(drawing.FullName, target.FullName, overwrite: true);
+        }
+
+        return target;
+    }
+
+    private void ShowDrawing(MskLibraryRow row, FileInfo drawing, bool fromCache)
+    {
+        DrawingViewerSource = new Uri(drawing.FullName);
+        DrawingStatusText = fromCache
+            ? $"PDF-чертеж IPS {row.Ips} открыт из кэша: {drawing.Name}"
+            : $"PDF-чертеж IPS {row.Ips} загружен и открыт: {drawing.Name}";
+        StatusText = DrawingStatusText;
+    }
+
+    internal static DirectoryInfo GetDrawingCacheDirectory()
+    {
+        var configured = Environment.GetEnvironmentVariable("BLANK_DEMAND_DRAWINGS_CACHE_DIR");
+        var path = string.IsNullOrWhiteSpace(configured)
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "BlankDemandPlanner",
+                "IpsDrawings")
+            : configured;
         return Directory.CreateDirectory(path);
     }
 
@@ -3075,7 +7204,7 @@ public sealed partial class MskViewModel(
             : Rows.FirstOrDefault(x => string.Equals(x.Ips, ips, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static MskCsvDetail? ResolveMskDetail(MskRecord? record, IReadOnlyDictionary<string, MskCsvDetail> details)
+    internal static MskCsvDetail? ResolveMskDetail(MskRecord? record, IReadOnlyDictionary<string, MskCsvDetail> details)
     {
         if (record is null)
         {
@@ -3087,7 +7216,91 @@ public sealed partial class MskViewModel(
             : details.TryGetValue($"IPS:{record.Ips}", out var byIps) ? byIps : null;
     }
 
-    private static IReadOnlyDictionary<string, MskCsvDetail> LoadMskDetailsFromReport()
+    private async Task TryAttachMskBlankAsync(Part part, MskCsvDetail? mskDetail)
+    {
+        if (mskDetail is null || string.IsNullOrWhiteSpace(mskDetail.OneCCode))
+        {
+            return;
+        }
+
+        var code = mskDetail.OneCCode.Trim();
+        var normalizedCode = StockCodeNormalizer.NormalizeForComparison(code);
+        var aliases = await dbContext.BlankAliases
+            .Include(x => x.CanonicalBlank)
+            .Where(x => x.IsActive && x.CanonicalBlank != null && x.CanonicalBlank.IsActive)
+            .ToListAsync();
+        var alias = aliases.FirstOrDefault(x =>
+            string.Equals(x.OneCCode, code, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(StockCodeNormalizer.NormalizeForComparison(x.OneCCode), normalizedCode, StringComparison.OrdinalIgnoreCase));
+        if (alias?.CanonicalBlank is null)
+        {
+            return;
+        }
+
+        var quantity = decimal.TryParse(
+            (mskDetail.ConsumptionQuantity ?? string.Empty).Trim().Replace('.', ','),
+            NumberStyles.Number,
+            CultureInfo.GetCultureInfo("ru-RU"),
+            out var parsedQuantity)
+            ? parsedQuantity
+            : 1m;
+        dbContext.PartBlankMaps.Add(new PartBlankMap
+        {
+            Part = part,
+            CanonicalBlank = alias.CanonicalBlank,
+            ConsumptionQuantity = quantity > 0 ? quantity : 1m,
+            ConsumptionUnit = ParseMskConsumptionUnit(mskDetail.UnitName, alias.CanonicalBlank.BaseUnit),
+            BlankLeadTimeDays = 30,
+            IsPrimary = true,
+            IsActive = true,
+            Source = "МСК; НСИ"
+        });
+    }
+
+    private static MeasurementUnit ParseMskConsumptionUnit(string? value, MeasurementUnit fallback)
+    {
+        var text = UiText.Clean(value).ToLowerInvariant();
+        if (text.Contains("пог", StringComparison.Ordinal) || text.Contains("м", StringComparison.Ordinal))
+        {
+            return MeasurementUnit.Meter;
+        }
+
+        if (text.Contains("шт", StringComparison.Ordinal))
+        {
+            return MeasurementUnit.Piece;
+        }
+
+        return fallback;
+    }
+
+    private static (string? Designation, string Name) SplitDesignationAndName(string? value)
+    {
+        var text = UiText.Clean(value).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return (null, string.Empty);
+        }
+
+        var index = text.IndexOf(' ');
+        if (index <= 0)
+        {
+            return (null, text);
+        }
+
+        var first = text[..index].Trim();
+        var rest = text[(index + 1)..].Trim();
+        var looksLikeDesignation = first.Any(char.IsDigit) &&
+            first.Length >= 5 &&
+            first.Any(ch => ch is '.' or '-' or '_' or '/');
+        return looksLikeDesignation && !string.IsNullOrWhiteSpace(rest)
+            ? (first, rest)
+            : (null, text);
+    }
+
+    private static bool IsArchivedLibrarySource(string? source) =>
+        !string.IsNullOrWhiteSpace(source) && source.Contains("[ARCHIVED_LIBRARY]", StringComparison.OrdinalIgnoreCase);
+
+    internal static IReadOnlyDictionary<string, MskCsvDetail> LoadMskDetailsFromReport()
     {
         var path = FindWorkspaceFile(Path.Combine("reports", "msk_excel_analysis_20260723", "msk_library_extract.csv"));
         if (path is null || !File.Exists(path))
@@ -3348,6 +7561,18 @@ public sealed class IpsBridgeDrawingService : IIpsDrawingService
         {
             args["role_name"] = settings.RoleName;
         }
+        else
+        {
+            var role = await GetFirstLoginRoleAsync(http, settings, sessionId, tools, cancellationToken);
+            if (role.RoleId is not null)
+            {
+                args["role_id"] = role.RoleId.Value;
+            }
+            else if (!string.IsNullOrWhiteSpace(role.RoleName))
+            {
+                args["role_name"] = role.RoleName;
+            }
+        }
 
         using var document = await CallToolAsync(http, settings, sessionId, tools["login"], args, cancellationToken);
         var payload = ExtractPayload(document);
@@ -3355,6 +7580,50 @@ public sealed class IpsBridgeDrawingService : IIpsDrawingService
         return string.IsNullOrWhiteSpace(session)
             ? throw new InvalidOperationException("IPS Bridge login не вернул session_id.")
             : session;
+    }
+
+    private static async Task<(int? RoleId, string? RoleName)> GetFirstLoginRoleAsync(
+        HttpClient http,
+        IpsBridgeSettings settings,
+        string? sessionId,
+        IReadOnlyDictionary<string, JsonElement> tools,
+        CancellationToken cancellationToken)
+    {
+        var tool = tools.TryGetValue("list_login_roles", out var listLoginRoles)
+            ? listLoginRoles
+            : tools.TryGetValue("get_login_roles", out var getLoginRoles) ? getLoginRoles : default;
+        if (tool.ValueKind == JsonValueKind.Undefined)
+        {
+            return (null, null);
+        }
+
+        try
+        {
+            using var document = await CallToolAsync(http, settings, sessionId, tool, new Dictionary<string, object?>
+            {
+                ["username"] = settings.Username
+            }, cancellationToken);
+            var payload = ExtractPayload(document);
+            foreach (var nested in Walk(payload))
+            {
+                if (nested.ValueKind == JsonValueKind.Array)
+                {
+                    var first = nested.EnumerateArray().FirstOrDefault(x => x.ValueKind == JsonValueKind.Object);
+                    if (first.ValueKind == JsonValueKind.Object)
+                    {
+                        return (
+                            ReadInt(first, "RoleId") ?? ReadInt(first, "role_id") ?? ReadInt(first, "id"),
+                            ReadString(first, "RoleName") ?? ReadString(first, "role_name") ?? ReadString(first, "name"));
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Some bridge builds do not expose role discovery; login without role can still work there.
+        }
+
+        return (null, null);
     }
 
     private static async Task<List<JsonElement>> SearchObjectsAsync(HttpClient http, IpsBridgeSettings settings, string? mcpSessionId, IReadOnlyDictionary<string, JsonElement> tools, string ipsSessionId, string query, CancellationToken cancellationToken)
@@ -3877,36 +8146,75 @@ public sealed record IpsBridgeSettings(
     }
 }
 
-public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext dbContext) : ObservableObject
+public sealed partial class BlankSelectionViewModel(
+    BlankDemandPlannerDbContext dbContext,
+    IIpsDrawingService? ipsDrawingService = null,
+    ILogger? logger = null) : ObservableObject
 {
     private bool suppressPartSearchChanged;
+    private bool suppressAutoFind;
+    private bool isAutoFinding;
+    private bool rerunAutoFind;
+    private int autoFindVersion;
+    private int partDetailVersion;
+    private int partDrawingVersion;
+    private readonly IIpsDrawingService drawingService = ipsDrawingService ?? new IpsBridgeDrawingService();
 
     public ObservableCollection<BlankSelectionRow> Rows { get; } = [];
     public ObservableCollection<PartWithoutBlankOption> PartSuggestions { get; } = [];
-    public IReadOnlyList<DisplayOption<MeasurementUnit>> UnitTypes { get; } = UiText.ConsumptionUnitTypes;
-    public IReadOnlyList<DisplayOption<BlankType?>> BlankTypeFilters { get; } =
-    [
-        new((BlankType?)null, "Все подходящие"),
-        ..UiText.BlankTypes
-            .Where(x => x.Value is not BlankType.Unknown and not BlankType.CustomBlank and not BlankType.Purchased)
-            .Select(x => new DisplayOption<BlankType?>(x.Value, x.DisplayName))
-    ];
+    public ObservableCollection<DisplayOption<MeasurementUnit>> UnitTypes { get; } = [..UiReferenceData.ConsumptionUnitTypes()];
+    public ObservableCollection<DisplayOption<BlankType?>> BlankTypeFilters { get; } = [..UiReferenceData.SuggestedBlankTypeFilters()];
 
-    [ObservableProperty] private DisplayOption<BlankType?> selectedBlankType = new(null, "Все подходящие");
+    [ObservableProperty] private DisplayOption<BlankType?> selectedBlankType = UiReferenceData.SuggestedBlankTypeFilters()[0];
     [ObservableProperty] private string partSearch = string.Empty;
     [ObservableProperty] private bool isPartSuggestionsOpen;
     [ObservableProperty] private PartWithoutBlankOption? selectedPart;
     [ObservableProperty] private BlankSelectionRow? selectedBlankRow;
     [ObservableProperty] private string consumptionQuantityText = "1";
-    [ObservableProperty] private DisplayOption<MeasurementUnit> selectedUnit = UiText.ConsumptionUnitTypes[0];
+    [ObservableProperty] private DisplayOption<MeasurementUnit> selectedUnit = UiReferenceData.ConsumptionUnitTypes()[0];
     [ObservableProperty] private string material = string.Empty;
+    [ObservableProperty] private bool positiveStockOnly;
     [ObservableProperty] private string diameterText = string.Empty;
     [ObservableProperty] private string widthText = string.Empty;
     [ObservableProperty] private string heightText = string.Empty;
     [ObservableProperty] private string thicknessText = string.Empty;
     [ObservableProperty] private string wallThicknessText = string.Empty;
     [ObservableProperty] private string lengthText = string.Empty;
-    [ObservableProperty] private string statusText = "Введите размеры детали и нажмите \"Подобрать\".";
+    [ObservableProperty] private string statusText = "Введите вид, материал или размеры детали для подбора заготовки.";
+    [ObservableProperty] private string partDetailText = "Выберите деталь без заготовки для просмотра информации.";
+    [ObservableProperty] private Uri? drawingViewerSource;
+    [ObservableProperty] private string drawingStatusText = "PDF-чертеж не выбран.";
+    [ObservableProperty] private bool isDrawingBusy;
+
+    public void RefreshReferenceLists()
+    {
+        var selectedBlankTypeValue = SelectedBlankType.Value;
+        var selectedUnitValue = SelectedUnit.Value;
+
+        UiReferenceData.ReplaceOptions(UnitTypes, UiReferenceData.ConsumptionUnitTypes());
+        UiReferenceData.ReplaceOptions(BlankTypeFilters, UiReferenceData.SuggestedBlankTypeFilters());
+
+        SelectedBlankType = BlankTypeFilters.FirstOrDefault(x => x.Value == selectedBlankTypeValue) ?? BlankTypeFilters.First();
+        SelectedUnit = UnitTypes.FirstOrDefault(x => x.Value == selectedUnitValue) ?? UnitTypes.First();
+    }
+
+    partial void OnSelectedBlankTypeChanged(DisplayOption<BlankType?> value) => QueueAutoFind();
+
+    partial void OnMaterialChanged(string value) => QueueAutoFind();
+
+    partial void OnPositiveStockOnlyChanged(bool value) => QueueAutoFind();
+
+    partial void OnDiameterTextChanged(string value) => QueueAutoFind();
+
+    partial void OnWidthTextChanged(string value) => QueueAutoFind();
+
+    partial void OnHeightTextChanged(string value) => QueueAutoFind();
+
+    partial void OnThicknessTextChanged(string value) => QueueAutoFind();
+
+    partial void OnWallThicknessTextChanged(string value) => QueueAutoFind();
+
+    partial void OnLengthTextChanged(string value) => QueueAutoFind();
 
     partial void OnPartSearchChanged(string value)
     {
@@ -3930,6 +8238,9 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
         PartSearch = value.DisplayName;
         suppressPartSearchChanged = false;
         IsPartSuggestionsOpen = false;
+        PartDetailText = BuildPartDetailText(value, null);
+        _ = LoadSelectedPartDetailAsync(value, Interlocked.Increment(ref partDetailVersion));
+        _ = TryOpenSelectedPartDrawingAsync(value, Interlocked.Increment(ref partDrawingVersion));
         StatusText = $"Выбрана деталь без заготовки: {value.Ips}. Подберите заготовку и нажмите \"Добавить в библиотеку\".";
     }
 
@@ -3941,6 +8252,52 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
         }
     }
 
+    private void QueueAutoFind()
+    {
+        if (suppressAutoFind)
+        {
+            return;
+        }
+
+        var version = Interlocked.Increment(ref autoFindVersion);
+        _ = RunAutoFindAsync(version);
+    }
+
+    private async Task RunAutoFindAsync(int version)
+    {
+        var started = false;
+        try
+        {
+            await Task.Delay(300);
+            if (version != Volatile.Read(ref autoFindVersion))
+            {
+                return;
+            }
+
+            if (isAutoFinding)
+            {
+                rerunAutoFind = true;
+                return;
+            }
+
+            isAutoFinding = true;
+            started = true;
+            await FindAsync();
+        }
+        finally
+        {
+            if (started)
+            {
+                isAutoFinding = false;
+                if (rerunAutoFind || version != Volatile.Read(ref autoFindVersion))
+                {
+                    rerunAutoFind = false;
+                    QueueAutoFind();
+                }
+            }
+        }
+    }
+
     public async Task LoadAsync() => await LoadPartSuggestionsAsync(openDropDown: false);
 
     [RelayCommand]
@@ -3949,17 +8306,57 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
     private async Task LoadPartSuggestionsAsync(bool openDropDown)
     {
         var search = (PartSearch ?? string.Empty).Trim();
-        var query = dbContext.Parts.AsNoTracking()
-            .Where(x => !x.BlankMaps.Any(m => m.IsActive));
+        var query = ActiveLibraryPartsWithoutBlankQuery();
+
+        if (SelectedPart is not null && !string.Equals(search, SelectedPart.DisplayName, StringComparison.Ordinal))
+        {
+            SelectedPart = null;
+        }
+
+        if (SelectedPart is not null)
+        {
+            var stillVisible = PartSuggestions.Any(x => x.PartId == SelectedPart.PartId) ||
+                await query.AnyAsync(x => x.Id == SelectedPart.PartId);
+            if (!stillVisible)
+            {
+                SelectedPart = null;
+            }
+        }
+
+        query = ActiveLibraryPartsWithoutBlankQuery();
+
+        if (SelectedPart is not null && string.Equals(search, SelectedPart.DisplayName, StringComparison.Ordinal))
+        {
+            PartSuggestions.Clear();
+            PartSuggestions.Add(SelectedPart);
+            IsPartSuggestionsOpen = false;
+            return;
+        }
 
         if (!string.IsNullOrWhiteSpace(search))
         {
             var normalized = ExtractIps(search);
-            query = query.Where(x =>
-                x.Ips.Contains(search) ||
-                x.Ips.Contains(normalized) ||
-                (x.Designation != null && x.Designation.Contains(search)) ||
-                x.Name.Contains(search));
+            var searchedParts = await query
+                .OrderBy(x => x.Ips)
+                .Take(5000)
+                .ToListAsync();
+            searchedParts = searchedParts
+                .Where(x => UiSearchText.ContainsAnyField(search,
+                    x.Ips,
+                    normalized,
+                    x.Designation,
+                    x.Name))
+                .Take(80)
+                .ToList();
+
+            PartSuggestions.Clear();
+            foreach (var part in searchedParts.Select(x => new PartWithoutBlankOption(x.Id, x.Ips, x.Designation, x.Name)))
+            {
+                PartSuggestions.Add(part);
+            }
+
+            IsPartSuggestionsOpen = openDropDown && PartSuggestions.Count > 0;
+            return;
         }
 
         var parts = await query
@@ -3976,6 +8373,11 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
 
         IsPartSuggestionsOpen = openDropDown && PartSuggestions.Count > 0;
     }
+
+    private IQueryable<Part> ActiveLibraryPartsWithoutBlankQuery() =>
+        dbContext.Parts.AsNoTracking()
+            .Where(x => x.Source == null || !x.Source.Contains("[ARCHIVED_LIBRARY]"))
+            .Where(x => !x.BlankMaps.Any(m => m.IsActive));
 
     [RelayCommand]
     public async Task FindAsync()
@@ -4010,6 +8412,9 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
             .ThenBy(x => x.CanonicalName)
             .Take(20000)
             .ToListAsync();
+        blanks = blanks
+            .Where(x => x.Aliases.Any(a => a.IsActive))
+            .ToList();
         if (!string.IsNullOrWhiteSpace(Material))
         {
             var materialKey = NormalizeMaterial(Material);
@@ -4023,17 +8428,21 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
             .ThenByDescending(x => x.ImportedAt)
             .Select(x => (long?)x.Id)
             .FirstOrDefaultAsync();
-        var stockByCode = latestSnapshotId is null
-            ? new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase)
+        var stockItemsForSelection = latestSnapshotId is null
+            ? []
             : await dbContext.StockItems.AsNoTracking()
                 .Where(x => x.StockSnapshotId == latestSnapshotId.Value)
-                .GroupBy(x => x.OneCCode)
-                .ToDictionaryAsync(x => x.Key, x => x.Sum(i => i.Quantity), StringComparer.OrdinalIgnoreCase);
+                .ToListAsync();
+        var stockByCode = stockItemsForSelection
+            .GroupBy(x => StockCodeNormalizer.NormalizeForComparison(x.OneCCode), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.Sum(i => i.Quantity), StringComparer.OrdinalIgnoreCase);
 
+        var selectedBlankId = SelectedBlankRow?.BlankId;
         var matches = blanks
             .Select(blank => TryBuildMatch(blank, request, stockByCode))
             .Where(x => x is not null)
             .Select(x => x!)
+            .Where(x => !PositiveStockOnly || x.StockValue > 0)
             .OrderBy(x => x.AllowanceScore)
             .ThenBy(x => x.BlankType)
             .ThenBy(x => x.SourceName)
@@ -4046,7 +8455,9 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
             Rows.Add(row);
         }
 
-        SelectedBlankRow = Rows.FirstOrDefault();
+        SelectedBlankRow = selectedBlankId is null
+            ? Rows.FirstOrDefault()
+            : Rows.FirstOrDefault(x => x.BlankId == selectedBlankId.Value) ?? Rows.FirstOrDefault();
         StatusText = Rows.Count == 0
             ? "Подходящие заготовки не найдены. Проверьте вид, материал и размеры."
             : $"Подобрано заготовок: {Rows.Count}. Сортировка от меньшего припуска к большему.";
@@ -4098,6 +8509,11 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
 
         StatusText = $"Добавлено в библиотеку: {part.Ips} -> {SelectedBlankRow.OneCCode} ({FormatDecimal(quantity)} {SelectedUnit.DisplayName}).";
         SelectedPart = null;
+        PartDetailText = "Выберите деталь без заготовки для просмотра информации.";
+        Interlocked.Increment(ref partDetailVersion);
+        DrawingViewerSource = null;
+        DrawingStatusText = "PDF-чертеж не выбран.";
+        Interlocked.Increment(ref partDrawingVersion);
         IsPartSuggestionsOpen = false;
         PartSearch = string.Empty;
         await LoadPartSuggestionsAsync();
@@ -4106,21 +8522,35 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
     [RelayCommand]
     private void Clear()
     {
-        SelectedBlankType = BlankTypeFilters[0];
-        PartSearch = string.Empty;
-        SelectedPart = null;
-        SelectedBlankRow = null;
-        ConsumptionQuantityText = "1";
-        SelectedUnit = UnitTypes[0];
-        Material = string.Empty;
-        DiameterText = string.Empty;
-        WidthText = string.Empty;
-        HeightText = string.Empty;
-        ThicknessText = string.Empty;
-        WallThicknessText = string.Empty;
-        LengthText = string.Empty;
-        Rows.Clear();
-        StatusText = "Поля очищены.";
+        suppressAutoFind = true;
+        try
+        {
+            SelectedBlankType = BlankTypeFilters[0];
+            PartSearch = string.Empty;
+            SelectedPart = null;
+            PartDetailText = "Выберите деталь без заготовки для просмотра информации.";
+            Interlocked.Increment(ref partDetailVersion);
+            DrawingViewerSource = null;
+            DrawingStatusText = "PDF-чертеж не выбран.";
+            Interlocked.Increment(ref partDrawingVersion);
+            SelectedBlankRow = null;
+            ConsumptionQuantityText = "1";
+            SelectedUnit = UnitTypes[0];
+            Material = string.Empty;
+            DiameterText = string.Empty;
+            WidthText = string.Empty;
+            HeightText = string.Empty;
+            ThicknessText = string.Empty;
+            WallThicknessText = string.Empty;
+            LengthText = string.Empty;
+            Rows.Clear();
+            StatusText = "Поля очищены.";
+        }
+        finally
+        {
+            suppressAutoFind = false;
+            Interlocked.Increment(ref autoFindVersion);
+        }
     }
 
     private async Task<Part?> ResolvePartAsync()
@@ -4137,9 +8567,135 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
         }
 
         return await dbContext.Parts
+            .Where(x => x.Source == null || !x.Source.Contains("[ARCHIVED_LIBRARY]"))
             .Where(x => !x.BlankMaps.Any(m => m.IsActive))
             .FirstOrDefaultAsync(x => x.Ips == ips);
     }
+
+    private async Task LoadSelectedPartDetailAsync(PartWithoutBlankOption option, int version)
+    {
+        try
+        {
+            var record = await dbContext.MskRecords.AsNoTracking()
+                .Where(x => x.Ips == option.Ips)
+                .OrderByDescending(x => x.ImportedAt)
+                .FirstOrDefaultAsync();
+            var detail = MskViewModel.ResolveMskDetail(record, MskViewModel.LoadMskDetailsFromReport());
+            if (version == Volatile.Read(ref partDetailVersion) && SelectedPart?.PartId == option.PartId)
+            {
+                PartDetailText = BuildPartDetailText(option, detail);
+            }
+        }
+        catch
+        {
+            if (version == Volatile.Read(ref partDetailVersion) && SelectedPart?.PartId == option.PartId)
+            {
+                PartDetailText = BuildPartDetailText(option, null);
+            }
+        }
+    }
+
+    private async Task TryOpenSelectedPartDrawingAsync(PartWithoutBlankOption option, int version)
+    {
+        if (string.IsNullOrWhiteSpace(option.Ips))
+        {
+            return;
+        }
+
+        var row = new MskLibraryRow(
+            option.Ips,
+            UiText.Clean(option.Designation),
+            UiText.Clean(option.PartName),
+            string.Empty,
+            "Да",
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            "30");
+        var outputDirectory = MskViewModel.GetDrawingCacheDirectory();
+        var cachedDrawing = MskViewModel.GetStableCachedDrawing(row, outputDirectory);
+        if (MskViewModel.IsReadablePdf(cachedDrawing))
+        {
+            ShowSelectedPartDrawing(option, cachedDrawing, fromCache: true, version);
+            return;
+        }
+
+        try
+        {
+            IsDrawingBusy = true;
+            DrawingStatusText = $"Поиск PDF-чертежа IPS {option.Ips}...";
+            var drawing = MskViewModel.FindLocalDrawingPdf(row);
+            if (drawing is not null)
+            {
+                var localStableDrawing = MskViewModel.CopyToStableCache(row, drawing, outputDirectory);
+                ShowSelectedPartDrawing(option, localStableDrawing, fromCache: false, version);
+                return;
+            }
+
+            foreach (var query in MskViewModel.BuildDrawingQueries(row))
+            {
+                var bridgeDrawing = await drawingService.FindDrawingPdfAsync(query, outputDirectory, CancellationToken.None);
+                if (bridgeDrawing is not null && MskViewModel.IsReadablePdf(bridgeDrawing))
+                {
+                    var stableDrawing = MskViewModel.CopyToStableCache(row, bridgeDrawing, outputDirectory);
+                    ShowSelectedPartDrawing(option, stableDrawing, fromCache: false, version);
+                    return;
+                }
+            }
+
+            if (version == Volatile.Read(ref partDrawingVersion) && SelectedPart?.PartId == option.PartId)
+            {
+                DrawingViewerSource = null;
+                DrawingStatusText = $"PDF-чертеж IPS {option.Ips} не найден.";
+            }
+        }
+        catch (Exception ex)
+        {
+            logger?.LogWarning(ex, "Could not open drawing for blank selection part {Ips}", option.Ips);
+            if (version == Volatile.Read(ref partDrawingVersion) && SelectedPart?.PartId == option.PartId)
+            {
+                DrawingStatusText = $"PDF-чертеж IPS {option.Ips} не открыт: {ex.GetBaseException().Message}";
+            }
+        }
+        finally
+        {
+            IsDrawingBusy = false;
+        }
+    }
+
+    private void ShowSelectedPartDrawing(PartWithoutBlankOption option, FileInfo drawing, bool fromCache, int version)
+    {
+        if (version != Volatile.Read(ref partDrawingVersion) || SelectedPart?.PartId != option.PartId)
+        {
+            return;
+        }
+
+        DrawingViewerSource = new Uri(drawing.FullName);
+        DrawingStatusText = fromCache
+            ? $"PDF-чертеж IPS {option.Ips} открыт из кэша: {drawing.Name}"
+            : $"PDF-чертеж IPS {option.Ips} открыт: {drawing.Name}";
+    }
+
+    private static string BuildPartDetailText(PartWithoutBlankOption option, MskCsvDetail? detail) =>
+        $"IPS: {option.Ips}\n" +
+        $"Обозначение: {UiText.Clean(option.Designation)}\n" +
+        $"Наименование: {UiText.Clean(option.PartName)}\n" +
+        $"Вид заготовки: {FirstNotEmpty(detail?.BlankType, "Не подобрана")}\n" +
+        $"Заготовка: {FirstNotEmpty(detail?.BlankName, "Не подобрана")}\n" +
+        $"Материал: {UiText.Clean(detail?.Material)}\n" +
+        $"Код УТ: {UiText.Clean(detail?.OneCCode)}\n" +
+        $"Норма расхода: {FirstNotEmpty(detail?.ConsumptionQuantity, "1")} {FirstNotEmpty(detail?.UnitName, "шт")}\n" +
+        "Срок заготовки, дней: 30\n" +
+        "Есть в библиотеке: Да\n" +
+        $"Есть МСК: {(detail is null ? "Нет" : "Да")}";
+
+    private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) ?? string.Empty;
 
     private static BlankSelectionRow? TryBuildMatch(CanonicalBlank blank, BlankSelectionRequest request, IReadOnlyDictionary<string, decimal> stockByCode)
     {
@@ -4154,10 +8710,15 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
             return null;
         }
 
-        var alias = blank.Aliases.FirstOrDefault(x => x.IsActive) ?? blank.Aliases.FirstOrDefault();
+        var alias = blank.Aliases.FirstOrDefault(x => x.IsActive);
+        if (alias is null)
+        {
+            return null;
+        }
+
         var stock = blank.Aliases
-            .Where(x => !string.IsNullOrWhiteSpace(x.OneCCode) && stockByCode.TryGetValue(x.OneCCode, out _))
-            .Sum(x => stockByCode.TryGetValue(x.OneCCode, out var quantity) ? quantity : 0m);
+            .Where(x => !string.IsNullOrWhiteSpace(x.OneCCode) && stockByCode.TryGetValue(StockCodeNormalizer.NormalizeForComparison(x.OneCCode), out _))
+            .Sum(x => stockByCode.TryGetValue(StockCodeNormalizer.NormalizeForComparison(x.OneCCode), out var quantity) ? quantity : 0m);
         var allowance = comparisons.Sum(x => x.BlankValue - x.RequiredValue);
         var details = comparisons.Length == 0
             ? "Размеры не заданы, показано по виду/материалу"
@@ -4172,6 +8733,7 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
             FormatSize(blank),
             UiText.DisplayUnit(blank.BaseUnit),
             blank.BaseUnit,
+            stock,
             FormatDecimal(stock),
             FormatDecimal(allowance),
             allowance,
@@ -4180,7 +8742,7 @@ public sealed partial class BlankSelectionViewModel(BlankDemandPlannerDbContext 
 
     private static IEnumerable<DimensionComparison> BuildComparisons(CanonicalBlank blank, BlankSelectionRequest request)
     {
-        if (blank.BlankType is BlankType.RoundBar or BlankType.BronzeBar or BlankType.PipeRound)
+        if (blank.BlankType is BlankType.RoundBar or BlankType.BronzeBar or BlankType.PipeRound or BlankType.Forging)
         {
             var requiredDiameter = request.Diameter ?? Max(request.Width, request.Height, request.Thickness);
             if (requiredDiameter is not null && blank.DiameterMm is not null)
@@ -4274,24 +8836,58 @@ public sealed partial class CalculationViewModel(
     BlankDemandPlannerDbContext dbContext,
     IBlankDemandCalculationService calculationService,
     IReportExportService reportExportService,
-    IFileDialogService fileDialogService) : ObservableObject
+    IFileDialogService fileDialogService,
+    IIpsDrawingService? ipsDrawingService = null,
+    ILogger? logger = null) : ObservableObject
 {
     public ObservableCollection<CalculationMaterialRow> Rows { get; } = [];
     public ObservableCollection<LibraryBlankOption> BlankSuggestions { get; } = [];
-    public IReadOnlyList<DisplayOption<MeasurementUnit>> UnitTypes { get; } = UiText.ConsumptionUnitTypes;
+    public ObservableCollection<DisplayOption<MeasurementUnit>> UnitTypes { get; } = [..UiReferenceData.ConsumptionUnitTypes()];
+    public ObservableCollection<DisplayOption<BlankType?>> BlankTypeFilters { get; } = [..UiReferenceData.CalculationBlankTypeFilters()];
     private const string OneTimeBlankComment = "Разовая заготовка из расчета";
+    private readonly IIpsDrawingService drawingService = ipsDrawingService ?? new IpsBridgeDrawingService();
     [ObservableProperty] private string statusText = string.Empty;
+    [ObservableProperty] private string search = string.Empty;
     [ObservableProperty] private CalculationMaterialRow? selectedRow;
     [ObservableProperty] private string blankSearch = string.Empty;
+    [ObservableProperty] private DisplayOption<BlankType?> selectedBlankType = UiReferenceData.CalculationBlankTypeFilters()[0];
+    [ObservableProperty] private string material = string.Empty;
+    [ObservableProperty] private string diameterText = string.Empty;
+    [ObservableProperty] private string widthText = string.Empty;
+    [ObservableProperty] private string heightText = string.Empty;
+    [ObservableProperty] private string thicknessText = string.Empty;
+    [ObservableProperty] private string wallThicknessText = string.Empty;
+    [ObservableProperty] private string lengthText = string.Empty;
     [ObservableProperty] private LibraryBlankOption? selectedBlank;
     [ObservableProperty] private string selectedOneCCode = string.Empty;
     [ObservableProperty] private string consumptionQuantityText = "1";
-    [ObservableProperty] private DisplayOption<MeasurementUnit> selectedUnit = UiText.ConsumptionUnitTypes[0];
+    [ObservableProperty] private DisplayOption<MeasurementUnit> selectedUnit = UiReferenceData.ConsumptionUnitTypes()[0];
     [ObservableProperty] private string assignmentStatus = string.Empty;
     private long? _lastRunId;
     private long? _lastBatchId;
 
+    public void RefreshReferenceLists()
+    {
+        var selectedBlankTypeValue = SelectedBlankType.Value;
+        var selectedUnitValue = SelectedUnit.Value;
+
+        UiReferenceData.ReplaceOptions(UnitTypes, UiReferenceData.ConsumptionUnitTypes());
+        UiReferenceData.ReplaceOptions(BlankTypeFilters, UiReferenceData.CalculationBlankTypeFilters());
+
+        SelectedBlankType = BlankTypeFilters.FirstOrDefault(x => x.Value == selectedBlankTypeValue) ?? BlankTypeFilters.First();
+        SelectedUnit = UnitTypes.FirstOrDefault(x => x.Value == selectedUnitValue) ?? UnitTypes.First();
+    }
+
+    partial void OnSearchChanged(string value) => _ = LoadLastRunAsync();
     partial void OnBlankSearchChanged(string value) => _ = LoadBlankSuggestionsAsync();
+    partial void OnSelectedBlankTypeChanged(DisplayOption<BlankType?> value) => _ = LoadBlankSuggestionsAsync();
+    partial void OnMaterialChanged(string value) => _ = LoadBlankSuggestionsAsync();
+    partial void OnDiameterTextChanged(string value) => _ = LoadBlankSuggestionsAsync();
+    partial void OnWidthTextChanged(string value) => _ = LoadBlankSuggestionsAsync();
+    partial void OnHeightTextChanged(string value) => _ = LoadBlankSuggestionsAsync();
+    partial void OnThicknessTextChanged(string value) => _ = LoadBlankSuggestionsAsync();
+    partial void OnWallThicknessTextChanged(string value) => _ = LoadBlankSuggestionsAsync();
+    partial void OnLengthTextChanged(string value) => _ = LoadBlankSuggestionsAsync();
     partial void OnSelectedBlankChanged(LibraryBlankOption? value)
     {
         SelectedOneCCode = value?.OneCCode ?? string.Empty;
@@ -4379,7 +8975,9 @@ public sealed partial class CalculationViewModel(
         _lastRunId = run.Id;
         _lastBatchId = run.DemandBatchId;
         await LoadMaterialRowsAsync(run);
-        StatusText = $"Расчет материалов #{run.Id}, строк заявки: {Rows.Count}";
+        StatusText = string.IsNullOrWhiteSpace(Search)
+            ? $"Расчет материалов #{run.Id}, строк заявки: {Rows.Count}"
+            : $"Расчет материалов #{run.Id}, показано строк: {Rows.Count}";
     }
 
     [RelayCommand]
@@ -4461,41 +9059,92 @@ public sealed partial class CalculationViewModel(
     }
 
     [RelayCommand]
+    private async Task OpenDrawingAsync(object? parameter)
+    {
+        var row = parameter as CalculationMaterialRow ?? SelectedRow;
+        if (row is null)
+        {
+            AssignmentStatus = "Выберите строку расчета для открытия чертежа.";
+            return;
+        }
+
+        SelectedRow = row;
+        AssignmentStatus = await DrawingPdfOpener.OpenExternalAsync(
+            new DrawingLookupRequest(row.Ips, null, row.Name, null),
+            drawingService,
+            "Расчет материалов",
+            logger,
+            CancellationToken.None);
+    }
+
+    [RelayCommand]
     private async Task LoadBlankSuggestionsAsync()
     {
-        var query = dbContext.CanonicalBlanks.AsNoTracking()
-            .Include(x => x.Aliases)
-            .Where(x => x.IsActive);
+        var query = dbContext.BlankAliases.AsNoTracking()
+            .Include(x => x.CanonicalBlank)
+            .Where(x => x.IsActive && x.CanonicalBlank != null && x.CanonicalBlank.IsActive);
 
         var searchText = BlankSearch.Trim();
-        var options = await query
-            .OrderBy(x => x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault() ?? x.CanonicalName)
-            .Take(5000)
+        var request = new BlankSelectionRequest(
+            ParseCalculationNullable(DiameterText),
+            ParseCalculationNullable(WidthText),
+            ParseCalculationNullable(HeightText),
+            ParseCalculationNullable(ThicknessText),
+            ParseCalculationNullable(WallThicknessText),
+            ParseCalculationNullable(LengthText));
+        if (SelectedBlankType.Value is not null)
+        {
+            var type = SelectedBlankType.Value.Value;
+            query = query.Where(x => x.CanonicalBlank != null && x.CanonicalBlank.BlankType == type);
+        }
+
+        var aliases = await query
+            .OrderBy(x => x.SourceName)
+            .Take(20000)
             .ToListAsync();
+        if (!string.IsNullOrWhiteSpace(Material))
+        {
+            var materialKey = NormalizeCalculationMaterial(Material);
+            aliases = aliases
+                .Where(x => CalculationMaterialMatches(x, materialKey))
+                .ToList();
+        }
+
+        if (request.HasAnySize)
+        {
+            aliases = aliases
+                .Where(x => x.CanonicalBlank is not null && CalculationSizeMatches(x.CanonicalBlank, request))
+                .OrderBy(x => x.CanonicalBlank is null ? decimal.MaxValue : CalculationAllowanceScore(x.CanonicalBlank, request))
+                .ThenBy(x => x.SourceName)
+                .ToList();
+        }
+
         if (!string.IsNullOrWhiteSpace(searchText))
         {
-            options = options
+            aliases = aliases
                 .Where(x =>
-                    ContainsSearch(x.CanonicalName, searchText) ||
-                    ContainsSearch(x.Material, searchText) ||
-                    x.Aliases.Any(a => ContainsSearch(a.OneCCode, searchText) || ContainsSearch(a.SourceName, searchText)))
+                    ContainsSearch(x.CanonicalBlank?.CanonicalName, searchText) ||
+                    ContainsSearch(x.CanonicalBlank?.Material, searchText) ||
+                    ContainsSearch(x.OneCCode, searchText) ||
+                    ContainsSearch(x.SourceName, searchText))
                 .Take(50)
                 .ToList();
         }
         else
         {
-            options = options.Take(50).ToList();
+            aliases = aliases.Take(50).ToList();
         }
 
-        var blankOptions = options
+        var blankOptions = aliases
+            .Where(x => x.CanonicalBlank is not null)
             .Select(x => new LibraryBlankOption(
-                x.Id,
-                x.BlankType,
-                x.CanonicalName,
-                x.Aliases.Where(a => a.IsActive).Select(a => a.SourceName).FirstOrDefault(),
-                x.Material,
-                x.BaseUnit,
-                x.Aliases.Where(a => a.IsActive).Select(a => a.OneCCode).FirstOrDefault()))
+                x.CanonicalBlankId,
+                x.CanonicalBlank!.BlankType,
+                x.CanonicalBlank.CanonicalName,
+                x.SourceName,
+                x.CanonicalBlank.Material,
+                x.CanonicalBlank.BaseUnit,
+                x.OneCCode))
             .ToList();
 
         BlankSuggestions.Clear();
@@ -4510,12 +9159,95 @@ public sealed partial class CalculationViewModel(
         }
     }
 
+    private static bool CalculationSizeMatches(CanonicalBlank blank, BlankSelectionRequest request)
+    {
+        var comparisons = BuildCalculationComparisons(blank, request).ToArray();
+        return !request.HasAnySize || (comparisons.Length > 0 && comparisons.All(x => x.BlankValue >= x.RequiredValue));
+    }
+
+    private static decimal CalculationAllowanceScore(CanonicalBlank blank, BlankSelectionRequest request) =>
+        BuildCalculationComparisons(blank, request).Sum(x => x.BlankValue - x.RequiredValue);
+
+    private static IEnumerable<DimensionComparison> BuildCalculationComparisons(CanonicalBlank blank, BlankSelectionRequest request)
+    {
+        if (blank.BlankType is BlankType.RoundBar or BlankType.BronzeBar or BlankType.PipeRound or BlankType.Forging)
+        {
+            var requiredDiameter = request.Diameter ?? MaxCalculation(request.Width, request.Height, request.Thickness);
+            if (requiredDiameter is not null && blank.DiameterMm is not null)
+            {
+                yield return new DimensionComparison("D", requiredDiameter.Value, blank.DiameterMm.Value);
+            }
+
+            if (request.WallThickness is not null && blank.WallThicknessMm is not null)
+            {
+                yield return new DimensionComparison("S", request.WallThickness.Value, blank.WallThicknessMm.Value);
+            }
+        }
+        else if (blank.BlankType is BlankType.SquareBar or BlankType.HexBar)
+        {
+            var requiredWidth = request.Width ?? request.Diameter ?? MaxCalculation(request.Height, request.Thickness);
+            if (requiredWidth is not null && blank.WidthMm is not null)
+            {
+                yield return new DimensionComparison("W", requiredWidth.Value, blank.WidthMm.Value);
+            }
+        }
+        else
+        {
+            if (request.Width is not null && blank.WidthMm is not null)
+            {
+                yield return new DimensionComparison("W", request.Width.Value, blank.WidthMm.Value);
+            }
+
+            if (request.Height is not null && blank.HeightMm is not null)
+            {
+                yield return new DimensionComparison("H", request.Height.Value, blank.HeightMm.Value);
+            }
+
+            if (request.Thickness is not null && blank.ThicknessMm is not null)
+            {
+                yield return new DimensionComparison("T", request.Thickness.Value, blank.ThicknessMm.Value);
+            }
+        }
+
+        if (request.Length is not null && blank.LengthMm is not null)
+        {
+            yield return new DimensionComparison("L", request.Length.Value, blank.LengthMm.Value);
+        }
+    }
+
+    private static decimal? MaxCalculation(params decimal?[] values)
+    {
+        var present = values.Where(x => x is not null).Select(x => x!.Value).ToArray();
+        return present.Length == 0 ? null : present.Max();
+    }
+
+    private static decimal? ParseCalculationNullable(string? value) =>
+        decimal.TryParse((value ?? string.Empty).Trim().Replace('.', ','), NumberStyles.Number, CultureInfo.GetCultureInfo("ru-RU"), out var result)
+            ? result
+            : null;
+
+    private static string NormalizeCalculationMaterial(string value) => UiSearchText.Normalize(value).Replace(" ", string.Empty, StringComparison.Ordinal);
+
+    private static bool CalculationMaterialMatches(BlankAlias alias, string materialKey)
+    {
+        if (string.IsNullOrWhiteSpace(materialKey))
+        {
+            return true;
+        }
+
+        var blank = alias.CanonicalBlank;
+        return NormalizeCalculationMaterial(blank?.Material ?? string.Empty).Contains(materialKey, StringComparison.OrdinalIgnoreCase) ||
+            NormalizeCalculationMaterial(blank?.CanonicalName ?? string.Empty).Contains(materialKey, StringComparison.OrdinalIgnoreCase) ||
+            NormalizeCalculationMaterial(alias.SourceName).Contains(materialKey, StringComparison.OrdinalIgnoreCase) ||
+            NormalizeCalculationMaterial(alias.NormalizedSourceName).Contains(materialKey, StringComparison.OrdinalIgnoreCase);
+    }
+
     private async Task LoadMaterialRowsAsync(CalculationRun run)
     {
-        var purchaseRemaining = run.Items
-            .Where(x => x.CanonicalBlankId is not null && x.PurchaseQuantity > 0 && x.Status == CalculationStatus.Ok)
+        var stockRemaining = run.Items
+            .Where(x => x.CanonicalBlankId is not null && x.Status == CalculationStatus.Ok)
             .GroupBy(x => (BlankId: x.CanonicalBlankId!.Value, x.Unit))
-            .ToDictionary(x => x.Key, x => x.Sum(i => i.PurchaseQuantity));
+            .ToDictionary(x => x.Key, x => x.Sum(i => i.TotalStock));
 
         var demands = await dbContext.DemandItems.AsNoTracking()
             .Where(x => x.DemandBatchId == run.DemandBatchId)
@@ -4540,8 +9272,9 @@ public sealed partial class CalculationViewModel(
             .Where(x => x.DemandItemId is not null)
             .ToDictionary(x => x.DemandItemId!.Value, x => x.Item);
 
-        Rows.Clear();
+        var rows = new List<CalculationMaterialRow>();
         var number = 1;
+        var meterCutSourceCounts = new Dictionary<(long BlankId, MeasurementUnit Unit), int>();
         foreach (var demand in demands)
         {
             var inProduction = ApplyWorkInProgress(demand.Ips, demand.Quantity, workInProgressByIps, out var effectiveDemandQuantity);
@@ -4553,7 +9286,7 @@ public sealed partial class CalculationViewModel(
             if (oneTimeAssignments.TryGetValue(demand.Id, out var oneTimeItem))
             {
                 var source = oneTimeItem.Sources.FirstOrDefault();
-                Rows.Add(new CalculationMaterialRow(
+                rows.Add(new CalculationMaterialRow(
                     number++,
                     UiText.Clean(demand.Project),
                     UiText.Clean(FirstNotEmpty(demand.ProductionSystem, demand.SerialNumber)),
@@ -4581,7 +9314,7 @@ public sealed partial class CalculationViewModel(
                 .ToList() ?? [];
             if (maps.Count == 0)
             {
-                Rows.Add(new CalculationMaterialRow(
+                rows.Add(new CalculationMaterialRow(
                     number++,
                     UiText.Clean(demand.Project),
                     UiText.Clean(FirstNotEmpty(demand.ProductionSystem, demand.SerialNumber)),
@@ -4605,13 +9338,18 @@ public sealed partial class CalculationViewModel(
                 var blank = map.CanonicalBlank;
                 var alias = blank?.Aliases.FirstOrDefault(x => x.IsActive);
                 var required = effectiveDemandQuantity * map.ConsumptionQuantity * (1 + map.LossPercent / 100m);
-                var materialQuantity = AllocatePurchaseQuantity(purchaseRemaining, map.CanonicalBlankId, map.ConsumptionUnit, required);
-                if (materialQuantity <= 0)
+                var key = (map.CanonicalBlankId, map.ConsumptionUnit);
+                meterCutSourceCounts.TryGetValue(key, out var sourceCount);
+                var requiredWithCut = required + CalculateMeterCutAllowance(map.ConsumptionUnit, effectiveDemandQuantity, sourceCount);
+                meterCutSourceCounts[key] = sourceCount + 1;
+                var purchaseQuantity = AllocateUncoveredQuantity(stockRemaining, map.CanonicalBlankId, map.ConsumptionUnit, requiredWithCut);
+                if (purchaseQuantity <= 0)
                 {
                     continue;
                 }
 
-                Rows.Add(new CalculationMaterialRow(
+                var displayQuantity = Math.Min(required, purchaseQuantity);
+                rows.Add(new CalculationMaterialRow(
                     number++,
                     UiText.Clean(demand.Project),
                     UiText.Clean(FirstNotEmpty(demand.ProductionSystem, demand.SerialNumber)),
@@ -4623,24 +9361,63 @@ public sealed partial class CalculationViewModel(
                     blank is null ? string.Empty : UiText.DisplayBlankType(blank.BlankType),
                     UiText.Clean(alias?.SourceName ?? blank?.CanonicalName),
                     UiText.DisplayUnit(map.ConsumptionUnit),
-                    FormatDecimal(materialQuantity),
+                    FormatDecimal(displayQuantity),
                     FormatBlankDemandDate(demand.DemandDate, map.BlankLeadTimeDays),
                     false,
                     demand.Id));
             }
         }
+
+        var searchValue = Search.Trim();
+        var visibleRows = string.IsNullOrWhiteSpace(searchValue)
+            ? rows
+            : rows.Where(x => CalculationRowMatchesSearch(x, searchValue)).ToList();
+
+        Rows.Clear();
+        foreach (var row in visibleRows)
+        {
+            Rows.Add(row);
+        }
     }
 
-    private static decimal AllocatePurchaseQuantity(IDictionary<(long BlankId, MeasurementUnit Unit), decimal> purchaseRemaining, long blankId, MeasurementUnit unit, decimal required)
+    private static bool CalculationRowMatchesSearch(CalculationMaterialRow row, string searchValue) =>
+        UiSearchText.ContainsAnyField(searchValue,
+            row.ProductionSystem,
+            row.MachineNumber,
+            row.Ips,
+            row.Name,
+            row.OneCCode,
+            row.BlankType,
+            row.Nomenclature,
+            row.UnitName,
+            row.DemandDate);
+
+    private static decimal AllocateUncoveredQuantity(IDictionary<(long BlankId, MeasurementUnit Unit), decimal> stockRemaining, long blankId, MeasurementUnit unit, decimal required)
     {
-        if (!purchaseRemaining.TryGetValue((blankId, unit), out var remaining) || remaining <= 0 || required <= 0)
+        if (required <= 0)
         {
             return 0m;
         }
 
-        var allocated = Math.Min(required, remaining);
-        purchaseRemaining[(blankId, unit)] = remaining - allocated;
-        return allocated;
+        if (!stockRemaining.TryGetValue((blankId, unit), out var stock) || stock <= 0)
+        {
+            return required;
+        }
+
+        var covered = Math.Min(required, stock);
+        stockRemaining[(blankId, unit)] = stock - covered;
+        return required - covered;
+    }
+
+    private static decimal CalculateMeterCutAllowance(MeasurementUnit unit, decimal effectiveDemandQuantity, int existingSourceCount)
+    {
+        if (unit != MeasurementUnit.Meter || effectiveDemandQuantity <= 0)
+        {
+            return 0m;
+        }
+
+        var pieceCount = (int)Math.Ceiling(effectiveDemandQuantity);
+        return (Math.Max(0, pieceCount - 1) + (existingSourceCount > 0 ? 1 : 0)) * 0.005m;
     }
 
     private async Task<Dictionary<string, decimal>> LoadWorkInProgressByIpsAsync(string[] ipsValues)
@@ -4713,7 +9490,7 @@ public sealed partial class CalculationViewModel(
 
     private static string FirstNotEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) ?? string.Empty;
     private static bool ContainsSearch(string? value, string searchText) =>
-        !string.IsNullOrWhiteSpace(value) && value.Contains(searchText, StringComparison.OrdinalIgnoreCase);
+        UiSearchText.Contains(value, searchText);
     private static long? TryGetOneTimeDemandItemId(string? comment)
     {
         const string marker = "DemandItemId=";
@@ -4827,8 +9604,11 @@ public sealed partial class HistoryViewModel : ObservableObject
     }
 }
 
-public sealed partial class SettingsViewModel(BlankDemandPlannerDbContext dbContext) : ObservableObject
+public sealed partial class SettingsViewModel(BlankDemandPlannerDbContext dbContext, IAppAuthService authService) : ObservableObject
 {
+    private bool settingsLoaded;
+    private bool isLoadingSettings;
+
     public IReadOnlyList<string> FontFamilies { get; } = ["Segoe UI", "Arial", "Calibri", "Tahoma", "Times New Roman"];
     public IReadOnlyList<double> FontSizes { get; } = [12, 13, 14, 15, 16, 18, 20];
     public IReadOnlyList<DisplayOption<HorizontalAlignment>> ToolbarPlacements { get; } =
@@ -4837,41 +9617,109 @@ public sealed partial class SettingsViewModel(BlankDemandPlannerDbContext dbCont
         new(HorizontalAlignment.Center, "По центру"),
         new(HorizontalAlignment.Right, "Справа")
     ];
+    public IReadOnlyList<DisplayOption<Dock>> NavigationPlacements { get; } =
+    [
+        new(Dock.Left, "Слева"),
+        new(Dock.Right, "Справа"),
+        new(Dock.Top, "Сверху"),
+        new(Dock.Bottom, "Снизу")
+    ];
 
     [ObservableProperty] private string selectedFontFamily = "Segoe UI";
     [ObservableProperty] private double selectedFontSize = 13;
     [ObservableProperty] private DisplayOption<HorizontalAlignment> selectedToolbarPlacement = new(HorizontalAlignment.Left, "Слева");
     [ObservableProperty] private HorizontalAlignment toolbarHorizontalAlignment = HorizontalAlignment.Left;
+    [ObservableProperty] private DisplayOption<Dock> selectedNavigationPlacement = new(Dock.Left, "Слева");
+    [ObservableProperty] private Dock navigationDock = Dock.Left;
+    [ObservableProperty] private System.Windows.Controls.Orientation navigationOrientation = System.Windows.Controls.Orientation.Vertical;
+    [ObservableProperty] private double navigationPanelWidth = 168;
+    [ObservableProperty] private double navigationPanelHeight = double.NaN;
+    [ObservableProperty] private Thickness navigationListMargin = new(0, 22, 0, 0);
     [ObservableProperty] private string iconPath = string.Empty;
     [ObservableProperty] private string photoPath = string.Empty;
+    [ObservableProperty] private AppUserAdminRow? selectedUser;
+    [ObservableProperty] private string userName = string.Empty;
+    [ObservableProperty] private string userDisplayName = string.Empty;
+    [ObservableProperty] private string generatedPassword = string.Empty;
+    [ObservableProperty] private bool userIsAdmin;
+    [ObservableProperty] private bool userIsActive = true;
+    [ObservableProperty] private string currentPassword = string.Empty;
+    [ObservableProperty] private string newPassword = string.Empty;
+    [ObservableProperty] private string repeatPassword = string.Empty;
+    public bool IsAdmin => authService.CurrentUser?.IsAdmin == true;
+    public string SignedInUserText => authService.CurrentUser is null
+        ? "Пользователь не определен"
+        : $"{authService.CurrentUser.DisplayName} ({authService.CurrentUser.UserName})";
+    public ObservableCollection<AppUserAdminRow> Users { get; } = [];
+    public ObservableCollection<PermissionEditRow> PermissionRows { get; } = [];
     [ObservableProperty] private string statusText = "Настройки готовы";
 
     [RelayCommand]
     public async Task LoadAsync()
     {
-        SelectedFontFamily = await ReadSettingAsync("UI.FontFamily", "Segoe UI");
-        if (double.TryParse(await ReadSettingAsync("UI.FontSize", "13"), NumberStyles.Number, CultureInfo.InvariantCulture, out var fontSize))
+        if (!settingsLoaded)
         {
-            SelectedFontSize = Math.Clamp(fontSize, 10, 24);
+            isLoadingSettings = true;
+            try
+            {
+                SelectedFontFamily = await ReadSettingAsync("UI.FontFamily", "Segoe UI");
+                if (double.TryParse(await ReadSettingAsync("UI.FontSize", "13"), NumberStyles.Number, CultureInfo.InvariantCulture, out var fontSize))
+                {
+                    SelectedFontSize = Math.Clamp(fontSize, 10, 24);
+                }
+
+                var placement = await ReadSettingAsync("UI.ToolbarPlacement", "Left");
+                SelectedToolbarPlacement = ToolbarPlacements.FirstOrDefault(x => string.Equals(x.Value.ToString(), placement, StringComparison.OrdinalIgnoreCase))
+                    ?? ToolbarPlacements[0];
+                ToolbarHorizontalAlignment = SelectedToolbarPlacement.Value;
+                var navigationPlacement = await ReadSettingAsync("UI.NavigationPlacement", "Left");
+                SelectedNavigationPlacement = NavigationPlacements.FirstOrDefault(x => string.Equals(x.Value.ToString(), navigationPlacement, StringComparison.OrdinalIgnoreCase))
+                    ?? NavigationPlacements[0];
+                ApplyNavigationPlacement();
+                IconPath = await ReadSettingAsync("UI.IconPath", string.Empty);
+                PhotoPath = await ReadSettingAsync("UI.PhotoPath", string.Empty);
+                ApplyToWindow();
+                settingsLoaded = true;
+            }
+            finally
+            {
+                isLoadingSettings = false;
+            }
         }
 
-        var placement = await ReadSettingAsync("UI.ToolbarPlacement", "Left");
-        SelectedToolbarPlacement = ToolbarPlacements.FirstOrDefault(x => string.Equals(x.Value.ToString(), placement, StringComparison.OrdinalIgnoreCase))
-            ?? ToolbarPlacements[0];
-        ToolbarHorizontalAlignment = SelectedToolbarPlacement.Value;
-        IconPath = await ReadSettingAsync("UI.IconPath", string.Empty);
-        PhotoPath = await ReadSettingAsync("UI.PhotoPath", string.Empty);
-        ApplyToWindow();
+        await LoadUsersAsync();
+    }
+
+    private async Task LoadUsersAsync()
+    {
+        PermissionRows.Clear();
+        foreach (var definition in authService.PageDefinitions)
+        {
+            PermissionRows.Add(new PermissionEditRow(definition.PageKey, definition.Title, definition.PageKey == "Settings", false));
+        }
+
+        Users.Clear();
+        if (!IsAdmin)
+        {
+            return;
+        }
+
+        foreach (var user in await authService.GetUsersAsync())
+        {
+            Users.Add(user);
+        }
     }
 
     [RelayCommand]
     private async Task ApplyAsync()
     {
         ToolbarHorizontalAlignment = SelectedToolbarPlacement.Value;
+        ApplyNavigationPlacement();
         ApplyToWindow();
         await WriteSettingAsync("UI.FontFamily", SelectedFontFamily);
         await WriteSettingAsync("UI.FontSize", SelectedFontSize.ToString(CultureInfo.InvariantCulture));
         await WriteSettingAsync("UI.ToolbarPlacement", SelectedToolbarPlacement.Value.ToString());
+        await WriteSettingAsync("UI.NavigationPlacement", SelectedNavigationPlacement.Value.ToString());
         await WriteSettingAsync("UI.IconPath", IconPath);
         await WriteSettingAsync("UI.PhotoPath", PhotoPath);
         await dbContext.SaveChangesAsync();
@@ -4904,12 +9752,168 @@ public sealed partial class SettingsViewModel(BlankDemandPlannerDbContext dbCont
         SelectedFontFamily = "Segoe UI";
         SelectedFontSize = 13;
         SelectedToolbarPlacement = ToolbarPlacements[0];
+        SelectedNavigationPlacement = NavigationPlacements[0];
         IconPath = string.Empty;
         PhotoPath = string.Empty;
         await ApplyAsync();
     }
 
+    [RelayCommand]
+    private void GeneratePassword()
+    {
+        GeneratedPassword = authService.GeneratePassword();
+        StatusText = "Пароль сгенерирован. В базе хранится только bcrypt-хэш.";
+    }
+
+    [RelayCommand]
+    private void NewUser()
+    {
+        SelectedUser = null;
+        UserName = string.Empty;
+        UserDisplayName = string.Empty;
+        GeneratedPassword = authService.GeneratePassword();
+        UserIsAdmin = false;
+        UserIsActive = true;
+        foreach (var row in PermissionRows)
+        {
+            row.CanRead = row.PageKey == "Settings";
+            row.CanEdit = false;
+        }
+    }
+
+    [RelayCommand]
+    private async Task SaveUserAsync()
+    {
+        if (!IsAdmin)
+        {
+            StatusText = "Недостаточно прав.";
+            return;
+        }
+
+        var savedUserName = UserName.Trim();
+        var result = await authService.SaveUserAsync(new AppUserEditRequest(
+            SelectedUser?.Id,
+            UserName,
+            UserDisplayName,
+            UserIsAdmin,
+            UserIsActive,
+            string.IsNullOrWhiteSpace(GeneratedPassword) ? null : GeneratedPassword,
+            PermissionRows.Select(x => new AppUserPermissionRow(x.PageKey, x.CanRead, x.CanEdit)).ToList()));
+        StatusText = result.Message;
+        await LoadUsersAsync();
+        if (result.IsSuccess)
+        {
+            SelectedUser = Users.FirstOrDefault(x => string.Equals(x.UserName, savedUserName, StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    [RelayCommand]
+    private async Task ResetUserPasswordAsync()
+    {
+        if (!IsAdmin || SelectedUser is null)
+        {
+            StatusText = "Выберите пользователя.";
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(GeneratedPassword))
+        {
+            GeneratedPassword = authService.GeneratePassword();
+        }
+
+        var result = await authService.ResetPasswordAsync(SelectedUser.Id, GeneratedPassword);
+        StatusText = result.Message;
+        await LoadUsersAsync();
+    }
+
+    [RelayCommand]
+    private async Task DeleteUserAsync()
+    {
+        if (!IsAdmin || SelectedUser is null)
+        {
+            StatusText = "Выберите пользователя.";
+            return;
+        }
+
+        var userName = SelectedUser.UserName;
+        var result = await authService.DeleteUserAsync(SelectedUser.Id);
+        StatusText = result.Message;
+        await LoadUsersAsync();
+        if (result.IsSuccess)
+        {
+            SelectedUser = null;
+            NewUser();
+            StatusText = $"Пользователь {userName} удален из активного списка.";
+        }
+    }
+
+    [RelayCommand]
+    private async Task ChangeOwnPasswordAsync()
+    {
+        if (!string.Equals(NewPassword, RepeatPassword, StringComparison.Ordinal))
+        {
+            StatusText = "Новый пароль и повтор не совпадают.";
+            return;
+        }
+
+        var result = await authService.ChangeOwnPasswordAsync(CurrentPassword, NewPassword);
+        StatusText = result.Message;
+        if (result.IsSuccess)
+        {
+            CurrentPassword = string.Empty;
+            NewPassword = string.Empty;
+            RepeatPassword = string.Empty;
+        }
+    }
+
+    partial void OnSelectedUserChanged(AppUserAdminRow? value)
+    {
+        if (value is null)
+        {
+            return;
+        }
+
+        UserName = value.UserName;
+        UserDisplayName = value.DisplayName;
+        UserIsAdmin = value.IsAdmin;
+        UserIsActive = value.IsActive;
+        GeneratedPassword = string.Empty;
+        foreach (var row in PermissionRows)
+        {
+            var permission = value.Permissions.FirstOrDefault(x => x.PageKey == row.PageKey);
+            row.CanRead = value.IsAdmin || permission?.CanRead == true || row.PageKey == "Settings";
+            row.CanEdit = value.IsAdmin || permission?.CanEdit == true;
+        }
+    }
+
+    partial void OnSelectedFontFamilyChanged(string value)
+    {
+        if (!isLoadingSettings)
+        {
+            ApplyToWindow();
+        }
+    }
+
+    partial void OnSelectedFontSizeChanged(double value)
+    {
+        if (!isLoadingSettings)
+        {
+            ApplyToWindow();
+        }
+    }
+
     partial void OnSelectedToolbarPlacementChanged(DisplayOption<HorizontalAlignment> value) => ToolbarHorizontalAlignment = value.Value;
+    partial void OnSelectedNavigationPlacementChanged(DisplayOption<Dock> value) => ApplyNavigationPlacement();
+
+    private void ApplyNavigationPlacement()
+    {
+        NavigationDock = SelectedNavigationPlacement.Value;
+        var isHorizontal = NavigationDock is Dock.Top or Dock.Bottom;
+        NavigationOrientation = isHorizontal ? System.Windows.Controls.Orientation.Horizontal : System.Windows.Controls.Orientation.Vertical;
+        NavigationPanelWidth = isHorizontal ? double.NaN : 168;
+        NavigationPanelHeight = isHorizontal ? 48 : double.NaN;
+        NavigationListMargin = isHorizontal ? new Thickness(10, 4, 10, 4) : new Thickness(0, 22, 0, 0);
+    }
 
     private void ApplyToWindow()
     {
@@ -4959,6 +9963,334 @@ public sealed partial class SettingsViewModel(BlankDemandPlannerDbContext dbCont
     }
 }
 
+public sealed partial class PermissionEditRow(string pageKey, string title, bool canRead, bool canEdit) : ObservableObject
+{
+    public string PageKey { get; } = pageKey;
+    public string Title { get; } = title;
+    [ObservableProperty] private bool canRead = canRead;
+    [ObservableProperty] private bool canEdit = canEdit;
+}
+
+public sealed partial class DeveloperModeViewModel(
+    BlankDemandPlannerDbContext dbContext,
+    IAppAuthService authService,
+    Func<Task>? afterSave = null) : ObservableObject
+{
+    public ObservableCollection<DeveloperOptionRow> UnitRows { get; } = [];
+    public ObservableCollection<DeveloperOptionRow> ServiceRows { get; } = [];
+    public ObservableCollection<DeveloperOptionRow> SupplyRows { get; } = [];
+    public ObservableCollection<DeveloperOptionRow> BlankTypeRows { get; } = [];
+    [ObservableProperty] private string statusText = "Режим разработчика доступен только администратору.";
+    public bool IsAdmin => authService.CurrentUser?.IsAdmin == true;
+
+    [RelayCommand]
+    public async Task LoadAsync()
+    {
+        if (!IsAdmin)
+        {
+            StatusText = "Недостаточно прав.";
+            return;
+        }
+
+        await UiReferenceData.LoadAsync(dbContext);
+        ReplaceRows(UnitRows, UiReferenceData.UnitEditorRows());
+        ReplaceRows(ServiceRows, UiReferenceData.ServiceEditorRows());
+        ReplaceRows(SupplyRows, UiReferenceData.SupplyEditorRows());
+        ReplaceRows(BlankTypeRows, UiReferenceData.BlankTypeEditorRows());
+        StatusText = "Справочники загружены.";
+    }
+
+    [RelayCommand]
+    private void AddUnit() => UnitRows.Add(new DeveloperOptionRow("Meter", "Новая ед.", true));
+
+    [RelayCommand]
+    private void AddService() => ServiceRows.Add(new DeveloperOptionRow("Custom", "Новая услуга", true));
+
+    [RelayCommand]
+    private void AddSupply() => SupplyRows.Add(new DeveloperOptionRow("Custom", "Новое условие", true));
+
+    [RelayCommand]
+    private void AddBlankType() => BlankTypeRows.Add(new DeveloperOptionRow(nameof(BlankType.CustomBlank), "Новый вид", true));
+
+    [RelayCommand]
+    private void RemoveUnit(DeveloperOptionRow? row) => RemoveRow(UnitRows, row);
+
+    [RelayCommand]
+    private void RemoveService(DeveloperOptionRow? row) => RemoveRow(ServiceRows, row);
+
+    [RelayCommand]
+    private void RemoveSupply(DeveloperOptionRow? row) => RemoveRow(SupplyRows, row);
+
+    [RelayCommand]
+    private void RemoveBlankType(DeveloperOptionRow? row) => RemoveRow(BlankTypeRows, row);
+
+    [RelayCommand]
+    private async Task SaveAsync()
+    {
+        if (!IsAdmin)
+        {
+            StatusText = "Недостаточно прав.";
+            return;
+        }
+
+        await UiReferenceData.SaveAsync(dbContext, new DeveloperReferenceLists(
+            UnitRows.Select(x => x.ToDto()).ToList(),
+            ServiceRows.Select(x => x.ToDto()).ToList(),
+            SupplyRows.Select(x => x.ToDto()).ToList(),
+            BlankTypeRows.Select(x => x.ToDto()).ToList()));
+        if (afterSave is not null)
+        {
+            await afterSave();
+        }
+
+        StatusText = "Справочники сохранены и применены к открытым вкладкам.";
+    }
+
+    private static void ReplaceRows(ObservableCollection<DeveloperOptionRow> target, IEnumerable<DeveloperOptionRow> source)
+    {
+        target.Clear();
+        foreach (var row in source)
+        {
+            target.Add(row);
+        }
+    }
+
+    private static void RemoveRow(ObservableCollection<DeveloperOptionRow> rows, DeveloperOptionRow? row)
+    {
+        if (row is not null)
+        {
+            rows.Remove(row);
+        }
+    }
+}
+
+public sealed partial class DeveloperOptionRow(string code, string displayName, bool isActive) : ObservableObject
+{
+    [ObservableProperty] private string code = code;
+    [ObservableProperty] private string displayName = displayName;
+    [ObservableProperty] private bool isActive = isActive;
+
+    public DeveloperReferenceOption ToDto() => new(Code.Trim(), DisplayName.Trim(), IsActive);
+}
+
+public sealed record DeveloperReferenceLists(
+    List<DeveloperReferenceOption> Units,
+    List<DeveloperReferenceOption> Services,
+    List<DeveloperReferenceOption> SupplyConditions,
+    List<DeveloperReferenceOption> BlankTypes);
+
+public sealed record DeveloperReferenceOption(string Code, string DisplayName, bool IsActive);
+
+public static class UiReferenceData
+{
+    private const string SettingKey = "Developer.ReferenceLists";
+    private static DeveloperReferenceLists current = CreateDefaults();
+
+    public static async Task LoadAsync(BlankDemandPlannerDbContext dbContext)
+    {
+        var json = await dbContext.Settings
+            .AsNoTracking()
+            .Where(x => x.Key == SettingKey)
+            .Select(x => x.Value)
+            .FirstOrDefaultAsync();
+        current = string.IsNullOrWhiteSpace(json)
+            ? CreateDefaults()
+            : JsonSerializer.Deserialize<DeveloperReferenceLists>(json) ?? CreateDefaults();
+    }
+
+    public static async Task SaveAsync(BlankDemandPlannerDbContext dbContext, DeveloperReferenceLists lists)
+    {
+        current = Normalize(lists);
+        var json = JsonSerializer.Serialize(current);
+        var setting = await dbContext.Settings.FirstOrDefaultAsync(x => x.Key == SettingKey);
+        if (setting is null)
+        {
+            dbContext.Settings.Add(new AppSetting { Key = SettingKey, Value = json });
+        }
+        else
+        {
+            setting.Value = json;
+        }
+
+        await dbContext.SaveChangesAsync();
+    }
+
+    public static IReadOnlyList<DisplayOption<MeasurementUnit>> UnitTypes() =>
+        current.Units
+            .Where(x => x.IsActive)
+            .Select(x => new DisplayOption<MeasurementUnit>(ParseUnitCode(x.Code), CleanName(x.DisplayName, x.Code)))
+            .ToList();
+
+    public static IReadOnlyList<DisplayOption<MeasurementUnit>> ConsumptionUnitTypes() =>
+        UnitTypes()
+            .Where(x => x.Value != MeasurementUnit.Kilogram)
+            .ToList();
+
+    public static IReadOnlyList<DisplayOption<MeasurementUnit?>> UnitFilters()
+    {
+        var seen = new HashSet<MeasurementUnit>();
+        return
+        [
+            new((MeasurementUnit?)null, "Все ед."),
+            ..UnitTypes()
+                .Where(x => seen.Add(x.Value))
+                .Select(x => new DisplayOption<MeasurementUnit?>(x.Value, x.Value == MeasurementUnit.Meter ? "пог. м" : x.DisplayName))
+        ];
+    }
+
+    public static IReadOnlyList<DisplayOption<MeasurementUnit?>> ConsumptionUnitFilters() =>
+    [
+        new((MeasurementUnit?)null, "Все ед."),
+        ..UnitFilters().Where(x => x.Value is MeasurementUnit.Piece or MeasurementUnit.Meter)
+    ];
+
+    public static IReadOnlyList<DisplayOption<BlankType>> BlankTypes() =>
+        current.BlankTypes
+            .Where(x => x.IsActive)
+            .Select(x => new DisplayOption<BlankType>(ParseBlankTypeCode(x.Code), CleanName(x.DisplayName, x.Code)))
+            .ToList();
+
+    public static IReadOnlyList<DisplayOption<BlankType?>> BlankTypeFilters(bool includeUnknown)
+    {
+        var types = BlankTypes()
+            .Where(x => includeUnknown || x.Value is not BlankType.Unknown and not BlankType.CustomBlank)
+            .Select(x => new DisplayOption<BlankType?>(x.Value, x.DisplayName));
+        return [new((BlankType?)null, "Все виды"), ..types];
+    }
+
+    public static IReadOnlyList<DisplayOption<BlankType?>> SuggestedBlankTypeFilters() =>
+    [
+        new((BlankType?)null, "Все подходящие"),
+        ..BlankTypes()
+            .Where(x => x.Value is not BlankType.Unknown and not BlankType.CustomBlank and not BlankType.Purchased)
+            .Select(x => new DisplayOption<BlankType?>(x.Value, x.DisplayName))
+    ];
+
+    public static IReadOnlyList<DisplayOption<BlankType?>> CalculationBlankTypeFilters() =>
+    [
+        new((BlankType?)null, "Все подходящие"),
+        ..BlankTypes()
+            .Where(x => x.Value is not BlankType.Unknown and not BlankType.CustomBlank)
+            .Select(x => new DisplayOption<BlankType?>(x.Value, x.DisplayName))
+    ];
+
+    public static IReadOnlyList<string> ServiceTypes() =>
+        current.Services
+            .Where(x => x.IsActive && !string.IsNullOrWhiteSpace(x.DisplayName))
+            .Select(x => x.DisplayName.Trim())
+            .DefaultIfEmpty("Хим окс")
+            .ToList();
+
+    public static string ServiceName(string code, string fallback) => LookupName(current.Services, code, fallback);
+    public static string SupplyConditionName(string code, string fallback) => LookupName(current.SupplyConditions, code, fallback);
+    public static bool IsServiceActive(string code) => IsActive(current.Services, code);
+    public static bool IsSupplyConditionActive(string code) => IsActive(current.SupplyConditions, code);
+
+    public static IReadOnlyList<DeveloperOptionRow> UnitEditorRows() => current.Units.Select(ToRow).ToList();
+    public static IReadOnlyList<DeveloperOptionRow> ServiceEditorRows() => current.Services.Select(ToRow).ToList();
+    public static IReadOnlyList<DeveloperOptionRow> SupplyEditorRows() => current.SupplyConditions.Select(ToRow).ToList();
+    public static IReadOnlyList<DeveloperOptionRow> BlankTypeEditorRows() => current.BlankTypes.Select(ToRow).ToList();
+
+    public static string DisplayUnit(MeasurementUnit unit)
+    {
+        var options = UnitTypes();
+        if (unit == MeasurementUnit.Meter)
+        {
+            return options.FirstOrDefault(x => x.Value == unit && !UiText.IsMillimeterOption(x))?.DisplayName ?? "пог. м";
+        }
+
+        return options.FirstOrDefault(x => x.Value == unit)?.DisplayName ?? unit.ToString();
+    }
+
+    public static string DisplayBlankType(BlankType type) =>
+        type == BlankType.CustomBlank ? "Прочее" : BlankTypes().FirstOrDefault(x => x.Value == type)?.DisplayName ?? UiText.DisplayHiddenBlankType(type);
+
+    public static void ReplaceOptions<T>(ObservableCollection<DisplayOption<T>> target, IEnumerable<DisplayOption<T>> source)
+    {
+        target.Clear();
+        foreach (var option in source)
+        {
+            target.Add(option);
+        }
+    }
+
+    private static DeveloperOptionRow ToRow(DeveloperReferenceOption option) => new(option.Code, option.DisplayName, option.IsActive);
+
+    private static string LookupName(IEnumerable<DeveloperReferenceOption> source, string code, string fallback) =>
+        source.FirstOrDefault(x => string.Equals(x.Code, code, StringComparison.OrdinalIgnoreCase))?.DisplayName.Trim()
+        ?? fallback;
+
+    private static bool IsActive(IEnumerable<DeveloperReferenceOption> source, string code) =>
+        source.FirstOrDefault(x => string.Equals(x.Code, code, StringComparison.OrdinalIgnoreCase))?.IsActive ?? true;
+
+    private static DeveloperReferenceLists Normalize(DeveloperReferenceLists lists) => new(
+        NormalizeList(lists.Units, CreateDefaults().Units),
+        NormalizeList(lists.Services, CreateDefaults().Services),
+        NormalizeList(lists.SupplyConditions, CreateDefaults().SupplyConditions),
+        NormalizeList(lists.BlankTypes, CreateDefaults().BlankTypes));
+
+    private static List<DeveloperReferenceOption> NormalizeList(IEnumerable<DeveloperReferenceOption> rows, IEnumerable<DeveloperReferenceOption> fallback)
+    {
+        var result = rows
+            .Select(x => new DeveloperReferenceOption(x.Code.Trim(), x.DisplayName.Trim(), x.IsActive))
+            .Where(x => !string.IsNullOrWhiteSpace(x.Code) && !string.IsNullOrWhiteSpace(x.DisplayName))
+            .ToList();
+        return result.Count == 0 ? fallback.ToList() : result;
+    }
+
+    private static DeveloperReferenceLists CreateDefaults() => new(
+        [
+            new(nameof(MeasurementUnit.Piece), "шт", true),
+            new(nameof(MeasurementUnit.Meter), "мм", true),
+            new(nameof(MeasurementUnit.Meter), "пог. м", true),
+            new(nameof(MeasurementUnit.Kilogram), "кг", true)
+        ],
+        [
+            new("ChemicalOxidation", "Хим окс", true),
+            new("Nitriding", "Азотирование", true),
+            new("Keyway", "Шпоночный паз", true),
+            new("HeatTreatment", "Термообработка", true)
+        ],
+        [
+            new("HeatTreatment", "ТО", true),
+            new("LaserCutting", "Лазерная резка", true)
+        ],
+        [
+            new(nameof(BlankType.RoundBar), "Круг", true),
+            new(nameof(BlankType.SquareBar), "Квадрат", true),
+            new(nameof(BlankType.HexBar), "Шестигранник", true),
+            new(nameof(BlankType.Sheet), "Лист", true),
+            new(nameof(BlankType.Plate), "Плита", true),
+            new(nameof(BlankType.PipeRound), "Труба профильная круглая", true),
+            new(nameof(BlankType.PipeRectangular), "Труба профильная прямоугольная", true),
+            new(nameof(BlankType.Angle), "Уголок", true),
+            new(nameof(BlankType.WeldingElement), "Сварное изделие", true),
+            new(nameof(BlankType.Purchased), "Покупная", true),
+            new(nameof(BlankType.Casting), "Литье", true),
+            new(nameof(BlankType.Forging), "Поковка", true),
+            new(nameof(BlankType.Unknown), "Не распознано", true)
+        ]);
+
+    private static MeasurementUnit ParseUnitCode(string code)
+    {
+        if (Enum.TryParse<MeasurementUnit>(code, ignoreCase: true, out var parsed))
+        {
+            return parsed;
+        }
+
+        var normalized = UiText.Clean(code);
+        if (normalized.Contains("кг", StringComparison.OrdinalIgnoreCase)) return MeasurementUnit.Kilogram;
+        if (normalized.Contains("м", StringComparison.OrdinalIgnoreCase)) return MeasurementUnit.Meter;
+        return MeasurementUnit.Piece;
+    }
+
+    private static BlankType ParseBlankTypeCode(string code) =>
+        Enum.TryParse<BlankType>(code, ignoreCase: true, out var parsed) ? parsed : BlankType.CustomBlank;
+
+    private static string CleanName(string name, string fallback) =>
+        string.IsNullOrWhiteSpace(name) ? fallback.Trim() : name.Trim();
+}
+
 internal static class UiText
 {
     public static IReadOnlyList<DisplayOption<BlankType>> BlankTypes { get; } =
@@ -4971,11 +10303,7 @@ internal static class UiText
         new(BlankType.PipeRound, "Труба профильная круглая"),
         new(BlankType.PipeRectangular, "Труба профильная прямоугольная"),
         new(BlankType.Angle, "Уголок"),
-        new(BlankType.Channel, "Швеллер"),
-        new(BlankType.IBeam, "Двутавр"),
-        new(BlankType.BronzeBar, "Пруток бронзовый"),
-        new(BlankType.BronzeSheet, "Лист бронзовый"),
-        new(BlankType.WeldingElement, "Сварочный элемент"),
+        new(BlankType.WeldingElement, "Сварное изделие"),
         new(BlankType.Purchased, "Покупная"),
         new(BlankType.Casting, "Литье"),
         new(BlankType.Forging, "Поковка"),
@@ -5004,6 +10332,7 @@ internal static class UiText
     public static IReadOnlyList<DisplayOption<MeasurementUnit>> ConsumptionUnitTypes { get; } =
     [
         new(MeasurementUnit.Piece, "шт"),
+        new(MeasurementUnit.Meter, "мм"),
         new(MeasurementUnit.Meter, "пог. м")
     ];
 
@@ -5022,9 +10351,22 @@ internal static class UiText
         new(MeasurementUnit.Meter, "пог. м")
     ];
 
-    public static string DisplayUnit(MeasurementUnit unit) => UnitTypes.FirstOrDefault(x => x.Value == unit)?.DisplayName ?? unit.ToString();
-    public static string DisplayBlankType(BlankType type) =>
-        type == BlankType.CustomBlank ? "Прочее" : BlankTypes.FirstOrDefault(x => x.Value == type)?.DisplayName ?? type.ToString();
+    public static string DisplayUnit(MeasurementUnit unit) => UiReferenceData.DisplayUnit(unit);
+    public static bool IsMillimeterOption(DisplayOption<MeasurementUnit>? option) =>
+        option is not null &&
+        option.Value == MeasurementUnit.Meter &&
+        string.Equals(Clean(option.DisplayName), "мм", StringComparison.OrdinalIgnoreCase);
+
+    public static string DisplayBlankType(BlankType type) => UiReferenceData.DisplayBlankType(type);
+
+    public static string DisplayHiddenBlankType(BlankType type) => type switch
+    {
+        BlankType.Channel => "Швеллер",
+        BlankType.IBeam => "Двутавр",
+        BlankType.BronzeBar => "Пруток бронзовый",
+        BlankType.BronzeSheet => "Лист бронзовый",
+        _ => type.ToString()
+    };
 
     public static string Clean(string? value)
     {
@@ -5119,12 +10461,188 @@ public sealed record LibraryDeleteSnapshot(List<LibraryMapSnapshot> Maps, List<L
 public sealed record LibraryMapSnapshot(long Id, bool IsActive, bool IsPrimary, DateTime UpdatedAt);
 public sealed record LibraryPartSnapshot(long Id, string? Source, DateTime UpdatedAt);
 
-public sealed record LibraryRow(long PartId, long? PartBlankMapId, long? CanonicalBlankId, string Ips, string? Designation, string PartName, string? BlankType, string? BlankName, string? Material, string? OneCCode, decimal? ConsumptionQuantity, MeasurementUnit? ConsumptionUnit, string Quantity, string UnitName, int BlankLeadTimeDays, string BlankLeadTimeDaysText, string? Source, string UpdatedAt);
+public sealed record NsiDeleteSnapshot(
+    List<NsiCanonicalBlankSnapshot> Blanks,
+    List<NsiBlankAliasSnapshot> Aliases,
+    List<NsiPartBlankMapSnapshot> Maps,
+    List<NsiStockLinkSnapshot> StockLinks,
+    List<NsiCalculationLinkSnapshot> CalculationLinks);
+
+public sealed record NsiCanonicalBlankSnapshot(
+    long Id,
+    string CanonicalName,
+    string CanonicalKey,
+    BlankType BlankType,
+    string? Material,
+    string? MaterialGost,
+    string? ProfileGost,
+    decimal? DiameterMm,
+    decimal? WidthMm,
+    decimal? HeightMm,
+    decimal? ThicknessMm,
+    decimal? WallThicknessMm,
+    decimal? LengthMm,
+    MeasurementUnit BaseUnit,
+    I012Status I012Status,
+    string? I012Section,
+    DateTime CreatedAt,
+    DateTime UpdatedAt,
+    bool IsActive)
+{
+    public CanonicalBlank ToEntity()
+    {
+        var blank = new CanonicalBlank();
+        ApplyTo(blank);
+        return blank;
+    }
+
+    public void ApplyTo(CanonicalBlank blank)
+    {
+        blank.Id = Id;
+        blank.CanonicalName = CanonicalName;
+        blank.CanonicalKey = CanonicalKey;
+        blank.BlankType = BlankType;
+        blank.Material = Material;
+        blank.MaterialGost = MaterialGost;
+        blank.ProfileGost = ProfileGost;
+        blank.DiameterMm = DiameterMm;
+        blank.WidthMm = WidthMm;
+        blank.HeightMm = HeightMm;
+        blank.ThicknessMm = ThicknessMm;
+        blank.WallThicknessMm = WallThicknessMm;
+        blank.LengthMm = LengthMm;
+        blank.BaseUnit = BaseUnit;
+        blank.I012Status = I012Status;
+        blank.I012Section = I012Section;
+        blank.CreatedAt = CreatedAt;
+        blank.UpdatedAt = UpdatedAt;
+        blank.IsActive = IsActive;
+    }
+}
+
+public sealed record NsiBlankAliasSnapshot(
+    long Id,
+    long CanonicalBlankId,
+    string OneCCode,
+    string SourceName,
+    string NormalizedSourceName,
+    string Source,
+    DateTime ImportedAt,
+    DateTime UpdatedAt,
+    bool IsActive)
+{
+    public BlankAlias ToEntity()
+    {
+        var alias = new BlankAlias();
+        ApplyTo(alias);
+        return alias;
+    }
+
+    public void ApplyTo(BlankAlias alias)
+    {
+        alias.Id = Id;
+        alias.CanonicalBlankId = CanonicalBlankId;
+        alias.OneCCode = OneCCode;
+        alias.SourceName = SourceName;
+        alias.NormalizedSourceName = NormalizedSourceName;
+        alias.Source = Source;
+        alias.ImportedAt = ImportedAt;
+        alias.UpdatedAt = UpdatedAt;
+        alias.IsActive = IsActive;
+    }
+}
+
+public sealed record NsiPartBlankMapSnapshot(
+    long Id,
+    long PartId,
+    long CanonicalBlankId,
+    decimal ConsumptionQuantity,
+    MeasurementUnit ConsumptionUnit,
+    decimal LossPercent,
+    int BlankLeadTimeDays,
+    string Source,
+    string? SourceFile,
+    DateTime UpdatedAt,
+    bool IsActive,
+    bool IsPrimary)
+{
+    public PartBlankMap ToEntity()
+    {
+        var map = new PartBlankMap();
+        ApplyTo(map);
+        return map;
+    }
+
+    public void ApplyTo(PartBlankMap map)
+    {
+        map.Id = Id;
+        map.PartId = PartId;
+        map.CanonicalBlankId = CanonicalBlankId;
+        map.ConsumptionQuantity = ConsumptionQuantity;
+        map.ConsumptionUnit = ConsumptionUnit;
+        map.LossPercent = LossPercent;
+        map.BlankLeadTimeDays = BlankLeadTimeDays;
+        map.Source = Source;
+        map.SourceFile = SourceFile;
+        map.UpdatedAt = UpdatedAt;
+        map.IsActive = IsActive;
+        map.IsPrimary = IsPrimary;
+    }
+}
+
+public sealed record NsiStockLinkSnapshot(long Id, long? BlankAliasId);
+public sealed record NsiCalculationLinkSnapshot(long Id, long? CanonicalBlankId);
+
+public sealed record LibraryRow(long PartId, long? PartBlankMapId, long? CanonicalBlankId, string Ips, string? Designation, string PartName, string Note, bool RequiresNitriding, bool RequiresHeatTreatment, bool RequiresChemicalOxidation, bool RequiresKeyway, string BlankSupplyRequirement, bool BlankSupplyRequiresHeatTreatment, bool BlankSupplyRequiresLaserCutting, string? BlankType, string? BlankName, string? Material, string? OneCCode, decimal? ConsumptionQuantity, MeasurementUnit? ConsumptionUnit, string Quantity, string UnitName, int BlankLeadTimeDays, string BlankLeadTimeDaysText, string? Source, string UpdatedAt, bool IsIncomplete);
 
 public sealed record LibraryBlankOption(long Id, BlankType BlankType, string CanonicalName, string? SourceName, string? Material, MeasurementUnit BaseUnit, string? OneCCode)
 {
     public string DisplayName => $"{UiText.Clean(string.IsNullOrWhiteSpace(SourceName) ? CanonicalName : SourceName)} | {OneCCode ?? "без УТ"}";
 }
+
+public sealed partial class ObjectCardRouteRow(
+    string operationNumber,
+    string operationName,
+    string workCenter,
+    string machineTimeText,
+    string setupTimeText,
+    string auxiliaryTimeText) : ObservableObject
+{
+    [ObservableProperty] private string operationNumber = operationNumber;
+    [ObservableProperty] private string operationName = operationName;
+    [ObservableProperty] private string workCenter = workCenter;
+    [ObservableProperty] private string machineTimeText = machineTimeText;
+    [ObservableProperty] private string setupTimeText = setupTimeText;
+    [ObservableProperty] private string auxiliaryTimeText = auxiliaryTimeText;
+
+    public int SequenceValue =>
+        int.TryParse(OperationNumber.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : 0;
+
+    public bool IsEmpty =>
+        string.IsNullOrWhiteSpace(OperationNumber) &&
+        string.IsNullOrWhiteSpace(OperationName) &&
+        string.IsNullOrWhiteSpace(WorkCenter);
+}
+
+public sealed partial class ObjectCardToolRow(
+    string operationNumber,
+    string operationName,
+    string toolingName,
+    string consumptionRate) : ObservableObject
+{
+    [ObservableProperty] private string operationNumber = operationNumber;
+    [ObservableProperty] private string operationName = operationName;
+    [ObservableProperty] private string toolingName = toolingName;
+    [ObservableProperty] private string consumptionRate = consumptionRate;
+
+    public bool IsEmpty =>
+        string.IsNullOrWhiteSpace(OperationNumber) &&
+        string.IsNullOrWhiteSpace(OperationName) &&
+        string.IsNullOrWhiteSpace(ToolingName) &&
+        string.IsNullOrWhiteSpace(ConsumptionRate);
+}
+
+public sealed record ObjectCardToolRowDto(string OperationNumber, string OperationName, string ToolingName, string ConsumptionRate);
 
 public sealed partial class DemandRow(long id, string project, string machineNumber, string ips, string name, string unitName, string quantity, string inProductionQuantity, string workInProgressBefore, string workInProgressAfter, string demandDate, bool isManual) : ObservableObject
 {
@@ -5153,7 +10671,7 @@ public sealed record PartWithoutBlankOption(long PartId, string Ips, string? Des
         : $"{Ips} | {UiText.Clean(Designation)} {UiText.Clean(PartName)}";
 }
 
-public sealed record BlankSelectionRow(long BlankId, string OneCCode, string SourceName, string BlankType, string Material, string Size, string UnitName, MeasurementUnit BaseUnit, string StockQuantity, string Allowance, decimal AllowanceScore, string Details);
+public sealed record BlankSelectionRow(long BlankId, string OneCCode, string SourceName, string BlankType, string Material, string Size, string UnitName, MeasurementUnit BaseUnit, decimal StockValue, string StockQuantity, string Allowance, decimal AllowanceScore, string Details);
 
 public sealed record BlankSelectionRequest(decimal? Diameter, decimal? Width, decimal? Height, decimal? Thickness, decimal? WallThickness, decimal? Length)
 {
@@ -5162,12 +10680,529 @@ public sealed record BlankSelectionRequest(decimal? Diameter, decimal? Width, de
 
 public sealed record DimensionComparison(string Label, decimal RequiredValue, decimal BlankValue);
 
-public sealed record NsiBlankRow(long AliasId, long CanonicalBlankId, string OneCCode, string SourceName, string UnitName, string BlankType, string Size, string Material, string MaterialGost, string ProfileGost, string CmoStockQuantity, string WarehouseStockQuantity, string StockUnitName, string BlankName, string Source, string UpdatedAt)
+public sealed record NsiBlankRow(long AliasId, long CanonicalBlankId, string OneCCode, string SourceName, string UnitName, string BlankType, string Size, string DuplicateKey, string Material, string MaterialGost, string ProfileGost, string CmoStockQuantity, string WarehouseStockQuantity, string StockUnitName, string Price, string BlankName, string Source, string UpdatedAt)
 {
     public string StockQuantity => CmoStockQuantity;
 }
 
 public sealed record NsiUsageRow(string Ips, string Designation, string PartName, string Quantity, string UnitName, string Source);
+
+public sealed record DrawingLookupRequest(string? Ips, string? Designation, string? Name, string? SourceFilePath);
+
+public static class DrawingPdfOpener
+{
+    public static async Task<FileInfo?> ResolveDrawingPdfAsync(
+        DrawingLookupRequest request,
+        IIpsDrawingService drawingService,
+        ILogger? logger,
+        CancellationToken cancellationToken)
+    {
+        var ips = UiText.Clean(request.Ips).Trim();
+        if (string.IsNullOrWhiteSpace(ips) &&
+            string.IsNullOrWhiteSpace(request.Designation) &&
+            string.IsNullOrWhiteSpace(request.Name))
+        {
+            return null;
+        }
+
+        try
+        {
+            var outputDirectory = GetDrawingCacheDirectory();
+            var cachedDrawing = GetStableCachedDrawing(request, outputDirectory);
+            if (cachedDrawing is not null && IsReadablePdf(cachedDrawing))
+            {
+                return cachedDrawing;
+            }
+
+            var localDrawing = FindLocalDrawingPdf(request);
+            if (localDrawing is not null)
+            {
+                return CopyToStableCache(request, localDrawing, outputDirectory);
+            }
+
+            foreach (var query in BuildDrawingQueries(request))
+            {
+                var bridgeDrawing = await drawingService.FindDrawingPdfAsync(query, outputDirectory, cancellationToken);
+                if (bridgeDrawing is not null && IsReadablePdf(bridgeDrawing))
+                {
+                    return CopyToStableCache(request, bridgeDrawing, outputDirectory);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            logger?.LogWarning(ex, "Could not resolve drawing for {Ips}", ips);
+        }
+
+        return null;
+    }
+
+    public static async Task<string> OpenExternalAsync(
+        DrawingLookupRequest request,
+        IIpsDrawingService drawingService,
+        string ownerTitle,
+        ILogger? logger,
+        CancellationToken cancellationToken)
+    {
+        var ips = UiText.Clean(request.Ips).Trim();
+        if (string.IsNullOrWhiteSpace(ips) &&
+            string.IsNullOrWhiteSpace(request.Designation) &&
+            string.IsNullOrWhiteSpace(request.Name))
+        {
+            var emptyMessage = "PDF-чертеж не выбран: в строке нет IPS, обозначения или наименования.";
+            MessageBox.Show(emptyMessage, ownerTitle, MessageBoxButton.OK, MessageBoxImage.Information);
+            return emptyMessage;
+        }
+
+        try
+        {
+            var outputDirectory = GetDrawingCacheDirectory();
+            var cachedDrawing = GetStableCachedDrawing(request, outputDirectory);
+            if (cachedDrawing is not null && IsReadablePdf(cachedDrawing))
+            {
+                OpenFile(cachedDrawing);
+                return $"PDF-чертеж открыт из кэша: {cachedDrawing.Name}";
+            }
+
+            var localDrawing = FindLocalDrawingPdf(request);
+            if (localDrawing is not null)
+            {
+                var stableDrawing = CopyToStableCache(request, localDrawing, outputDirectory);
+                OpenFile(stableDrawing);
+                return $"PDF-чертеж открыт: {stableDrawing.Name}";
+            }
+
+            foreach (var query in BuildDrawingQueries(request))
+            {
+                var bridgeDrawing = await drawingService.FindDrawingPdfAsync(query, outputDirectory, cancellationToken);
+                if (bridgeDrawing is not null && IsReadablePdf(bridgeDrawing))
+                {
+                    var stableDrawing = CopyToStableCache(request, bridgeDrawing, outputDirectory);
+                    OpenFile(stableDrawing);
+                    return $"PDF-чертеж открыт через IPS Bridge: {stableDrawing.Name}";
+                }
+            }
+
+            var notFoundMessage = string.IsNullOrWhiteSpace(ips)
+                ? "PDF-чертеж не найден локально и через IPS Bridge."
+                : $"PDF-чертеж IPS {ips} не найден локально и через IPS Bridge.";
+            MessageBox.Show(notFoundMessage, ownerTitle, MessageBoxButton.OK, MessageBoxImage.Information);
+            return notFoundMessage;
+        }
+        catch (Exception ex)
+        {
+            logger?.LogWarning(ex, "Could not open drawing for {Ips}", ips);
+            var message = string.IsNullOrWhiteSpace(ips)
+                ? $"PDF-чертеж не открыт: {ex.GetBaseException().Message}"
+                : $"PDF-чертеж IPS {ips} не открыт: {ex.GetBaseException().Message}";
+            MessageBox.Show(message, ownerTitle, MessageBoxButton.OK, MessageBoxImage.Error);
+            return message;
+        }
+    }
+
+    private static void OpenFile(FileInfo file) =>
+        Process.Start(new ProcessStartInfo(file.FullName) { UseShellExecute = true });
+
+    private static FileInfo? GetStableCachedDrawing(DrawingLookupRequest request, DirectoryInfo outputDirectory)
+    {
+        var key = FirstNotEmpty(request.Ips, request.Designation, request.Name);
+        return string.IsNullOrWhiteSpace(key)
+            ? null
+            : new FileInfo(Path.Combine(outputDirectory.FullName, MakeStableDrawingFileName(key)));
+    }
+
+    private static FileInfo? FindLocalDrawingPdf(DrawingLookupRequest request)
+    {
+        foreach (var candidate in EnumerateLocalDrawingCandidates(request))
+        {
+            if (IsReadablePdf(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static FileInfo CopyToStableCache(DrawingLookupRequest request, FileInfo drawing, DirectoryInfo outputDirectory)
+    {
+        outputDirectory.Create();
+        var target = GetStableCachedDrawing(request, outputDirectory) ??
+            new FileInfo(Path.Combine(outputDirectory.FullName, MakeStableDrawingFileName(Path.GetFileNameWithoutExtension(drawing.Name))));
+        if (!string.Equals(drawing.FullName, target.FullName, StringComparison.OrdinalIgnoreCase))
+        {
+            File.Copy(drawing.FullName, target.FullName, overwrite: true);
+        }
+
+        return target;
+    }
+
+    private static IEnumerable<FileInfo> EnumerateLocalDrawingCandidates(DrawingLookupRequest request)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in EnumerateExactDrawingPaths(request))
+        {
+            if (seen.Add(path))
+            {
+                yield return new FileInfo(path);
+            }
+        }
+
+        var tokens = new[]
+            {
+                request.Ips,
+                NormalizeNumericIps(request.Ips),
+                request.Designation,
+                request.Name,
+                Path.GetFileNameWithoutExtension(request.SourceFilePath)
+            }
+            .Select(NormalizeDrawingSearchText)
+            .Where(x => x.Length >= 4)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var directory in EnumerateDrawingDirectories(request))
+        {
+            if (!directory.Exists)
+            {
+                continue;
+            }
+
+            IEnumerable<FileInfo> files;
+            try
+            {
+                files = directory.EnumerateFiles("*.pdf", SearchOption.TopDirectoryOnly)
+                    .Concat(directory.EnumerateFiles("*.PDF", SearchOption.TopDirectoryOnly));
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var file in files)
+            {
+                if (!seen.Add(file.FullName))
+                {
+                    continue;
+                }
+
+                var normalizedName = NormalizeDrawingSearchText(Path.GetFileNameWithoutExtension(file.Name));
+                if (tokens.Any(token => normalizedName.Contains(token, StringComparison.OrdinalIgnoreCase) ||
+                    token.Contains(normalizedName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    yield return file;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateExactDrawingPaths(DrawingLookupRequest request)
+    {
+        if (!string.IsNullOrWhiteSpace(request.SourceFilePath))
+        {
+            var directory = Path.GetDirectoryName(request.SourceFilePath);
+            var fileName = Path.GetFileNameWithoutExtension(request.SourceFilePath);
+            if (!string.IsNullOrWhiteSpace(directory) && !string.IsNullOrWhiteSpace(fileName))
+            {
+                yield return Path.Combine(directory, $"{fileName}.pdf");
+                yield return Path.Combine(directory, $"{fileName}.PDF");
+            }
+        }
+
+        foreach (var directory in EnumerateDrawingDirectories(request))
+        {
+            foreach (var query in BuildDrawingQueries(request))
+            {
+                yield return Path.Combine(directory.FullName, $"{query}.pdf");
+                yield return Path.Combine(directory.FullName, $"{query}.PDF");
+            }
+        }
+    }
+
+    private static IEnumerable<DirectoryInfo> EnumerateDrawingDirectories(DrawingLookupRequest request)
+    {
+        yield return new DirectoryInfo(Path.Combine(Directory.GetCurrentDirectory(), "Данные для работы", "Чертежи"));
+        yield return new DirectoryInfo(Path.Combine(AppContext.BaseDirectory, "Данные для работы", "Чертежи"));
+        yield return new DirectoryInfo(Path.Combine(AppContext.BaseDirectory, "drawings"));
+        yield return new DirectoryInfo(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            "Интеграция с сервисами",
+            "factory_ai_assistant",
+            "data",
+            "drawings"));
+
+        if (!string.IsNullOrWhiteSpace(request.SourceFilePath))
+        {
+            var sourceDirectory = Path.GetDirectoryName(request.SourceFilePath);
+            if (!string.IsNullOrWhiteSpace(sourceDirectory))
+            {
+                yield return new DirectoryInfo(sourceDirectory);
+            }
+        }
+
+        var configured = Environment.GetEnvironmentVariable("BLANK_DEMAND_DRAWINGS_DIR");
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            foreach (var path in configured.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                yield return new DirectoryInfo(path);
+            }
+        }
+    }
+
+    private static IEnumerable<string> BuildDrawingQueries(DrawingLookupRequest request)
+    {
+        var values = new List<string?>
+        {
+            request.Ips,
+            NormalizeNumericIps(request.Ips),
+            request.Designation,
+            request.Name
+        };
+
+        return values
+            .Select(x => UiText.Clean(x).Trim())
+            .Where(x => x.Length >= 3)
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string? NormalizeNumericIps(string? value)
+    {
+        var text = UiText.Clean(value).Trim();
+        return text.Length > 0 && text.All(char.IsDigit) && text.Length < 11
+            ? text.PadLeft(11, '0')
+            : null;
+    }
+
+    private static string NormalizeDrawingSearchText(string? value)
+    {
+        var text = UiText.Clean(value);
+        return string.IsNullOrWhiteSpace(text)
+            ? string.Empty
+            : Regex.Replace(text.ToUpperInvariant(), @"[^0-9A-ZА-Я]+", string.Empty);
+    }
+
+    private static string MakeStableDrawingFileName(string value)
+    {
+        var safeValue = Regex.Replace(value, @"[^A-Za-zА-Яа-я0-9_. -]+", "_").Trim(' ', '_', '.');
+        return string.IsNullOrWhiteSpace(safeValue) ? "IPS.pdf" : $"IPS_{safeValue}.pdf";
+    }
+
+    private static bool IsReadablePdf(FileInfo file)
+    {
+        if (!file.Exists || file.Length < 4)
+        {
+            return false;
+        }
+
+        using var stream = file.OpenRead();
+        Span<byte> header = stackalloc byte[4];
+        return stream.Read(header) == 4 &&
+            header[0] == '%' &&
+            header[1] == 'P' &&
+            header[2] == 'D' &&
+            header[3] == 'F';
+    }
+
+    private static DirectoryInfo GetDrawingCacheDirectory()
+    {
+        var configured = Environment.GetEnvironmentVariable("BLANK_DEMAND_DRAWINGS_CACHE_DIR");
+        var path = string.IsNullOrWhiteSpace(configured)
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "BlankDemandPlanner",
+                "IpsDrawings")
+            : configured;
+        return Directory.CreateDirectory(path);
+    }
+
+    private static string FirstNotEmpty(params string?[] values) =>
+        values.Select(x => UiText.Clean(x).Trim()).FirstOrDefault(x => x.Length > 0) ?? string.Empty;
+}
+
+public static class UiSearchText
+{
+    public static bool Contains(string? value, string? searchText)
+    {
+        var normalizedSearch = Normalize(searchText);
+        if (normalizedSearch.Length == 0)
+        {
+            return true;
+        }
+
+        var normalizedValue = Normalize(value);
+        if (normalizedValue.Contains(normalizedSearch, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return BuildEquivalentTokens(normalizedSearch)
+            .Where(x => !string.Equals(x, normalizedSearch, StringComparison.Ordinal))
+            .Any(x => normalizedValue.Contains(x, StringComparison.Ordinal));
+    }
+
+    public static bool ContainsAnyField(string? searchText, params string?[] values)
+    {
+        var normalizedSearch = Normalize(searchText);
+        if (normalizedSearch.Length == 0)
+        {
+            return true;
+        }
+
+        if (values.Any(value => Contains(value, normalizedSearch)))
+        {
+            return true;
+        }
+
+        var normalizedValues = values
+            .Select(Normalize)
+            .Where(x => x.Length > 0)
+            .ToArray();
+        if (normalizedValues.Length == 0)
+        {
+            return false;
+        }
+
+        var combined = string.Join(' ', normalizedValues);
+        var tokens = SplitSearchTokens(normalizedSearch);
+        return tokens.Length > 1 && tokens.All(token =>
+            BuildEquivalentTokens(token).Any(candidate => combined.Contains(candidate, StringComparison.Ordinal)));
+    }
+
+    public static bool EqualsNormalized(string? value, string? searchText)
+    {
+        var normalizedSearch = Normalize(searchText);
+        return normalizedSearch.Length != 0 && string.Equals(Normalize(value), normalizedSearch, StringComparison.Ordinal);
+    }
+
+    public static string Normalize(string? value)
+    {
+        var text = UiText.Clean(value).Trim().ToUpperInvariant();
+        if (text.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        text = Regex.Replace(text, @"(?<![\p{L}\p{N}])Д\s*(?=\d)", "D", RegexOptions.CultureInvariant);
+
+        var result = new char[text.Length];
+        for (var i = 0; i < text.Length; i++)
+        {
+            result[i] = MapHomoglyph(text[i]);
+        }
+
+        return new string(result);
+    }
+
+    private static string[] SplitSearchTokens(string normalizedSearch) =>
+        normalizedSearch
+            .Split([' ', '\t', '\r', '\n', '|', ';', ','], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(x => x.Length > 0)
+            .ToArray();
+
+    private static IEnumerable<string> BuildEquivalentTokens(string token)
+    {
+        yield return token;
+        if (token.All(char.IsDigit))
+        {
+            var withoutLeadingZeros = token.TrimStart('0');
+            if (withoutLeadingZeros.Length == 0)
+            {
+                withoutLeadingZeros = "0";
+            }
+
+            yield return withoutLeadingZeros;
+            if (withoutLeadingZeros.Length is > 0 and < 11)
+            {
+                yield return withoutLeadingZeros.PadLeft(11, '0');
+            }
+        }
+    }
+
+    private static char MapHomoglyph(char value) => value switch
+    {
+        'А' => 'A',
+        'В' => 'B',
+        'Е' => 'E',
+        'К' => 'K',
+        'М' => 'M',
+        'Н' => 'H',
+        'О' => 'O',
+        'Р' => 'P',
+        'С' => 'C',
+        'Т' => 'T',
+        'У' => 'Y',
+        'Х' => 'X',
+        'Ё' => 'Е',
+        _ => value
+    };
+}
+
+public static class NsiDuplicateKey
+{
+    public static string Build(CanonicalBlank? blank, BlankAlias? alias = null)
+    {
+        if (blank is null || !blank.IsActive)
+        {
+            return string.Empty;
+        }
+
+        var material = NormalizePart(blank.Material);
+        var materialGost = NormalizePart(blank.MaterialGost);
+        var profileGost = NormalizePart(blank.ProfileGost);
+        var dimensions = new[]
+        {
+            ("D", blank.DiameterMm),
+            ("W", blank.WidthMm),
+            ("H", blank.HeightMm),
+            ("T", blank.ThicknessMm),
+            ("S", blank.WallThicknessMm),
+            ("L", blank.LengthMm)
+        }
+            .Where(x => x.Item2 is not null)
+            .Select(x => $"{x.Item1}{x.Item2!.Value.ToString("0.####", CultureInfo.InvariantCulture)}")
+            .ToArray();
+
+        if (dimensions.Length == 0)
+        {
+            var name = NormalizePart(alias?.SourceName ?? blank.CanonicalName);
+            if (name.Length == 0 || name == material)
+            {
+                return string.Empty;
+            }
+
+            return string.Join("|", (int)blank.BlankType, (int)blank.BaseUnit, name, material, materialGost, profileGost);
+        }
+
+        return string.Join("|", new[]
+        {
+            ((int)blank.BlankType).ToString(CultureInfo.InvariantCulture),
+            ((int)blank.BaseUnit).ToString(CultureInfo.InvariantCulture),
+            material,
+            materialGost,
+            profileGost,
+            string.Join(";", dimensions)
+        });
+    }
+
+    private static string NormalizePart(string? value)
+    {
+        var normalized = UiSearchText.Normalize(value);
+        return new string(normalized.Where(x => !char.IsWhiteSpace(x) && x != '-' && x != '_' && x != '/').ToArray());
+    }
+}
+
+public sealed class EmptyOneCNomenclatureService : IOneCNomenclatureService
+{
+    public Task<IReadOnlyList<OneCNomenclatureItem>> SearchAsync(string query, int limit, CancellationToken cancellationToken) =>
+        Task.FromResult<IReadOnlyList<OneCNomenclatureItem>>([]);
+
+    public Task<IReadOnlyList<OneCNomenclatureItem>> ResolveByCodesAsync(IEnumerable<string> codes, CancellationToken cancellationToken) =>
+        Task.FromResult<IReadOnlyList<OneCNomenclatureItem>>([]);
+
+    public Task<IReadOnlyList<OneCNomenclaturePrice>> ResolvePricesByCodesAsync(IEnumerable<string> codes, CancellationToken cancellationToken) =>
+        Task.FromResult<IReadOnlyList<OneCNomenclaturePrice>>([]);
+}
 
 public sealed record StockRow(string OneCCode, string SourceName, string Quantity, string UnitName, string Warehouse);
 
@@ -5187,6 +11222,78 @@ public sealed record MskLibraryRow(
     string ConsumptionQuantity,
     string UnitName,
     string BlankLeadTimeDays);
+
+public sealed record ProductionLaunchPreview(
+    string Ips,
+    string Designation,
+    string PartName,
+    string ComponentOneCCode,
+    string ComponentName,
+    decimal ConsumptionQuantity,
+    MeasurementUnit ConsumptionUnit,
+    decimal MaterialStockQuantity,
+    decimal MaxQuantity,
+    decimal DefaultQuantity,
+    string MaterialLine,
+    IReadOnlyList<ProductionLaunchShortageRow> ShortageRows);
+
+public sealed record ProductionLaunchDialogResult(decimal Quantity, string Comment, bool Piecewise);
+
+public sealed record ProductionLaunchShortageRow(decimal Quantity, string Project, string MachineNumber, DateTime? DemandDate);
+
+public sealed partial class ExternalServiceWipRow(
+    string oneCCode,
+    string ips,
+    string designation,
+    string name,
+    decimal availableQuantity,
+    string project,
+    string machineNumber,
+    DateTime? demandDate,
+    IReadOnlyList<ExternalServiceDemandAllocation>? demandAllocations = null,
+    bool requiresNitriding = false,
+    bool requiresHeatTreatment = false,
+    bool requiresChemicalOxidation = false,
+    bool requiresKeyway = false,
+    bool hasDemandRequirement = false) : ObservableObject
+{
+    public string OneCCode { get; } = oneCCode;
+    public string Ips { get; } = ips;
+    public string Designation { get; } = designation;
+    public string Name { get; } = name;
+    public decimal AvailableQuantity { get; } = availableQuantity;
+    public string AvailableText { get; } = availableQuantity.ToString("0.####", CultureInfo.GetCultureInfo("ru-RU"));
+    public string Project { get; } = project;
+    public string MachineNumber { get; } = machineNumber;
+    public DateTime? DemandDate { get; } = demandDate;
+    public string DemandDateText { get; } = demandDate?.ToString("dd.MM.yyyy", CultureInfo.GetCultureInfo("ru-RU")) ?? string.Empty;
+    public string Nomenclature { get; } = $"{designation} {name}".Trim();
+    public IReadOnlyList<ExternalServiceDemandAllocation> DemandAllocations { get; } = demandAllocations ?? [];
+    public bool RequiresNitriding { get; } = requiresNitriding;
+    public bool RequiresHeatTreatment { get; } = requiresHeatTreatment;
+    public bool RequiresChemicalOxidation { get; } = requiresChemicalOxidation;
+    public bool RequiresKeyway { get; } = requiresKeyway;
+    public bool HasDemandRequirement { get; } = hasDemandRequirement || (demandAllocations?.Any(x => x.DemandDate is not null && !string.Equals(x.MachineNumber, "на склад", StringComparison.OrdinalIgnoreCase)) ?? false);
+    public bool HasExternalServiceRequirement => RequiresNitriding || RequiresHeatTreatment || RequiresChemicalOxidation || RequiresKeyway;
+
+    [ObservableProperty] private bool isSelected;
+    [ObservableProperty] private string quantityText = availableQuantity.ToString("0.####", CultureInfo.GetCultureInfo("ru-RU"));
+}
+
+public sealed record ExternalServiceDemandAllocation(string Project, string MachineNumber, decimal Quantity, DateTime? DemandDate);
+
+public sealed record ExternalServiceRequestRow(
+    string Project,
+    string MachineNumber,
+    string Ips,
+    string Nomenclature,
+    string UnitName,
+    decimal Quantity,
+    string Justification,
+    DateTime? DemandDate,
+    DateTime ServiceReadyDate,
+    bool IsUrgent,
+    string Note);
 
 public sealed record MskCsvDetail(string Source, string Ips, string BlankType, string BlankName, string Material, string OneCCode, string ConsumptionQuantity, string UnitName);
 
